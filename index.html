@@ -1,0 +1,1879 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- __artifactory_data_bridge__ -->
+<script>(function dataBridgeImpl() {
+    // A read of a 20,000-row window chains dozens of server pages in the shell;
+    // give it room before declaring the shell absent.
+    const TIMEOUT_MS = 60000;
+    const pending = {};
+    const listeners = {};
+    let seq = 0;
+    function fail(code, message) {
+        const err = new Error(message);
+        err.code = code;
+        return err;
+    }
+    // Bare `parent`, matching the sibling bridges: works in the sandboxed
+    // iframe and in the vm-based test harness alike.
+    function post(msg) {
+        try {
+            parent.postMessage(msg, '*');
+        }
+        catch (_e) {
+            /* parent gone or blocked; nothing useful to do */
+        }
+    }
+    function call(type, payload) {
+        return new Promise(function (resolve, reject) {
+            seq += 1;
+            const requestId = 'afy-data-' + seq + '-' + Math.random().toString(36).slice(2, 10);
+            const timer = setTimeout(function () {
+                delete pending[requestId];
+                reject(fail('timeout', 'The viewer did not answer. Open this page inside Artifactory.'));
+            }, TIMEOUT_MS);
+            pending[requestId] = {
+                resolve: function (r) {
+                    clearTimeout(timer);
+                    delete pending[requestId];
+                    if (r.ok) {
+                        resolve(r);
+                        return;
+                    }
+                    const err = fail(r.code || 'internal', r.error || 'The data request failed.');
+                    // A conflict names the durable prefix and the rows as they are
+                    // now, so the page can say what happened instead of retrying.
+                    if (typeof r.applied === 'number')
+                        err.applied = r.applied;
+                    if (r.rows !== undefined)
+                        err.rows = r.rows;
+                    reject(err);
+                },
+                timer: timer,
+            };
+            const msg = { type: type, requestId: requestId };
+            for (const k in payload) {
+                if (payload[k] !== undefined)
+                    msg[k] = payload[k];
+            }
+            post(msg);
+        });
+    }
+    window.addEventListener('message', function (e) {
+        const d = e.data;
+        if (!d || typeof d !== 'object' || typeof d.type !== 'string')
+            return;
+        if ((d.type === 'artifactory-data-response' || d.type === 'artifactory-data-mutated') &&
+            typeof d.requestId === 'string') {
+            const p = pending[d.requestId];
+            if (p)
+                p.resolve(d);
+            return;
+        }
+        if (d.type === 'artifactory-data-changed' && typeof d.source === 'string') {
+            const subs = listeners[d.source];
+            if (!subs)
+                return;
+            for (let i = 0; i < subs.length; i++) {
+                try {
+                    subs[i](d);
+                }
+                catch (_err) {
+                    // One subscriber's fault must not starve the others.
+                }
+            }
+        }
+    });
+    const api = {
+        /** Read a window of rows. opts: { offset?: number, limit?: number }.
+         *
+         *  The reply's `caller` is the viewer's alias, resolved by the SERVER —
+         *  this is the ONLY way a page can learn who is looking at it. Use it to
+         *  mark a viewer's own rows; use `mutate({ identity })` to WRITE them. */
+        rows: function (source, opts) {
+            return call('artifactory-data-request', {
+                source: source,
+                offset: opts && opts.offset,
+                limit: opts && opts.limit,
+            }).then(function (r) {
+                const table = r;
+                /** Rows as records keyed by displayHeader (trimmed name or `col N`). */
+                table.objects = function () {
+                    const names = table.displayHeader || [];
+                    const out = [];
+                    const rows = table.rows || [];
+                    for (let i = 0; i < rows.length; i++) {
+                        const rec = {};
+                        for (let c = 0; c < names.length; c++)
+                            rec[names[c]] = rows[i][c] !== undefined ? rows[i][c] : '';
+                        out.push(rec);
+                    }
+                    return out;
+                };
+                return table;
+            });
+        },
+        /** Apply row operations against a key column. Durable when it resolves:
+         *  { applied, rows } with post-write records keyed by displayHeader.
+         *
+         *  Pass `identity: '<column>'` to have the SHELL record whoever is viewing
+         *  into that column. Do NOT put an alias in the row yourself — the value is
+         *  written server-side and any value you send for that column is dropped.
+         *  With `key` set to the same column you get one row per person, enforced by
+         *  the server:
+         *
+         *    mutate(src, { key: 'alias', identity: 'alias',
+         *                  ops: [{ op: 'upsert', row: { word: 'petrichor' } }] })
+         *
+         *  A page cannot learn its viewer any other way, and must never ask them to
+         *  type it. `rows(...)` reports the same identity as `caller`. */
+        mutate: function (source, req) {
+            return call('artifactory-data-mutate', {
+                source: source,
+                key: req && req.key,
+                identity: req && req.identity,
+                ops: req && req.ops,
+            });
+        },
+        /** Subscribe to live changes of a source. Returns the unsubscribe. */
+        onChange: function (source, listener) {
+            const subs = listeners[source] || (listeners[source] = []);
+            subs.push(listener);
+            return function () {
+                const i = subs.indexOf(listener);
+                if (i >= 0)
+                    subs.splice(i, 1);
+            };
+        },
+    };
+    const w = window;
+    w.artifactory = w.artifactory || {};
+    if (!w.artifactory.data)
+        w.artifactory.data = api;
+})();</script>
+<!-- __artifactory_state_bridge__ -->
+<script>(function stateBridgeImpl() {
+    const STATE_KEY = 'data-artifactory-state-key';
+    const BY_ATTR = 'data-artifactory-state-by';
+    const AT_ATTR = 'data-artifactory-state-at';
+    const SCOPE_ATTR = 'data-artifactory-state-scope';
+    const ANON_ATTR = 'data-artifactory-state-anon';
+    const TTL_ATTR = 'data-artifactory-state-ttl';
+    const POLL_ATTR = 'data-artifactory-state-poll';
+    const ROSTER_ATTR = 'data-artifactory-state-roster';
+    const SHOW_ATTR = 'data-artifactory-state-show';
+    let values = {};
+    let meta = {};
+    let aggregates = {};
+    let canWrite = false;
+    let canInteract = false;
+    let myAlias = null;
+    let announced = false;
+    const saveTimers = {};
+    // `dirty[key]` marks a text field with a LOCAL EDIT NOT YET SENT. It exists to
+    // stop a remote value from silently discarding what someone is part-way
+    // through writing. See the write-back listeners and the update handler below.
+    const dirty = {};
+    function post(msg) {
+        try {
+            parent.postMessage(msg, '*');
+        }
+        catch (_e) {
+            /* parent gone or blocked; nothing useful to do */
+        }
+    }
+    function keyedControls() {
+        return document.querySelectorAll('[' + STATE_KEY + ']');
+    }
+    function isPerUser(el) {
+        return (el.getAttribute(SCOPE_ATTR) || '').toLowerCase() === 'per-user';
+    }
+    function isAnon(el) {
+        return el.hasAttribute(ANON_ATTR);
+    }
+    /** Classify a tagged control so we know how to read/write/type it. */
+    function controlKind(el) {
+        const tag = el.tagName;
+        const type = (el.getAttribute('type') || '').toLowerCase();
+        if (tag === 'INPUT' && type === 'checkbox')
+            return 'bool';
+        if (tag === 'INPUT' && type === 'radio')
+            return 'radio';
+        if (tag === 'INPUT' && (type === 'number' || type === 'range'))
+            return 'number';
+        if (tag === 'SELECT')
+            return 'select';
+        if (tag === 'TEXTAREA')
+            return 'text';
+        if (tag === 'INPUT')
+            return 'text';
+        return 'other';
+    }
+    /**
+     * After the bridge sets a control's value programmatically (on hydrate or a
+     * remote update), fire input+change so AUTHOR JS hooked to those events runs
+     * — otherwise a value set via el.value/el.checked fires nothing, so e.g. a
+     * range slider's readout updates only on the window that dragged it, not on
+     * a viewer watching it move. Synthetic events carry isTrusted=false; the
+     * bridge's OWN write-listeners ignore those (see below), so this can't loop
+     * back into a write. `bubbles:true` so delegated author handlers catch it.
+     */
+    function fireSyntheticEvents(el) {
+        try {
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        catch (_e) {
+            /* an author handler threw; the value is already applied */
+        }
+    }
+    /*
+     * Assigning el.value collapses the selection to the end -- that IS the caret
+     * jump. A text control therefore keeps its selection ACROSS the assignment:
+     * the remote value still lands (the field is live, and a co-editor's text
+     * must appear) and the cursor stays where the person put it.
+     *
+     * Anchoring is DIFF-BASED, not offset-based. Two simpler schemes both fail:
+     *
+     *   absolute offset  breaks when the edit lands BEFORE the caret -- someone
+     *                    prepends a word and your cursor slides backwards
+     *                    through the text.
+     *   distance-from-end  breaks when the edit lands AFTER the caret, which is
+     *                    the common case (a co-editor typing at the end of the
+     *                    line). Measured: caret 10 hopped to 23 on an append,
+     *                    because "20 characters from the tail" moved with the
+     *                    tail. Reported as "the cursor is still hopping".
+     *
+     * So find where the text actually changed -- common prefix, common suffix --
+     * and shift the caret only if the change was upstream of it. An edit after
+     * the caret moves nothing; an edit before it moves it by exactly the length
+     * delta; an edit spanning it clamps into the rewritten span, which is the
+     * only case with no correct answer.
+     */
+    function mapCaret(oldValue, newValue, pos, prefixLen, suffixLen, delta) {
+        if (pos <= prefixLen)
+            return pos;
+        if (pos >= oldValue.length - suffixLen)
+            return pos + delta;
+        const lo = prefixLen;
+        const hi = newValue.length - suffixLen;
+        const out = pos + delta;
+        return out < lo ? lo : out > hi ? hi : out;
+    }
+    function setValueKeepingCaret(el, newValue) {
+        const oldValue = el.value;
+        if (oldValue === newValue)
+            return;
+        const selStart = el.selectionStart;
+        const selEnd = el.selectionEnd;
+        // Common prefix, then common suffix measured from the ends without letting
+        // the two regions overlap.
+        let prefixLen = 0;
+        const maxPrefix = Math.min(oldValue.length, newValue.length);
+        while (prefixLen < maxPrefix && oldValue.charCodeAt(prefixLen) === newValue.charCodeAt(prefixLen)) {
+            prefixLen++;
+        }
+        let suffixLen = 0;
+        const maxSuffix = Math.min(oldValue.length - prefixLen, newValue.length - prefixLen);
+        while (suffixLen < maxSuffix &&
+            oldValue.charCodeAt(oldValue.length - 1 - suffixLen) === newValue.charCodeAt(newValue.length - 1 - suffixLen)) {
+            suffixLen++;
+        }
+        // Do not cut a surrogate pair in half: a boundary inside an emoji would put
+        // the caret between the halves of one character.
+        const boundaryCode = newValue.charCodeAt(prefixLen);
+        if (prefixLen > 0 && boundaryCode >= 0xdc00 && boundaryCode <= 0xdfff)
+            prefixLen--;
+        const delta = newValue.length - oldValue.length;
+        el.value = newValue;
+        try {
+            el.setSelectionRange(mapCaret(oldValue, newValue, selStart, prefixLen, suffixLen, delta), mapCaret(oldValue, newValue, selEnd, prefixLen, suffixLen, delta));
+        }
+        catch (_e) {
+            /* selection not supported on this control; the value is already applied */
+        }
+    }
+    function applyTo(el, val) {
+        const kind = controlKind(el);
+        const control = el;
+        if (kind === 'bool') {
+            control.checked = val === 'true';
+            fireSyntheticEvents(el);
+        }
+        else if (kind === 'radio') {
+            control.checked = control.value === val;
+            fireSyntheticEvents(el);
+        }
+        else if (kind === 'select' || kind === 'text' || kind === 'number') {
+            const newValue = val == null ? '' : val;
+            // Only a focused TEXT control has a caret worth carrying. setSelectionRange
+            // throws on number/email inputs in some engines, so gate on kind, not just
+            // try/catch.
+            if (kind === 'text' && el === document.activeElement)
+                setValueKeepingCaret(control, newValue);
+            else
+                control.value = newValue;
+            fireSyntheticEvents(el);
+        }
+        else {
+            el.setAttribute('data-artifactory-state-value', val == null ? '' : val);
+        }
+    }
+    function readFrom(el) {
+        const kind = controlKind(el);
+        const control = el;
+        if (kind === 'bool')
+            return { valueType: 'BOOL', value: control.checked ? 'true' : 'false' };
+        if (kind === 'number')
+            return { valueType: 'NUMBER', value: control.value != null ? String(control.value) : '' };
+        return { valueType: 'STRING', value: control.value != null ? String(control.value) : '' };
+    }
+    /** A per-user control is writable when canInteract; a shared one when canWrite. */
+    function writable(el) {
+        return isPerUser(el) ? canInteract : canWrite;
+    }
+    /*
+     * Viewers get `disabled` (read-only). We do NOT add aria-readonly: it is
+     * spec-defined only for textbox/combobox/grid/listbox/slider roles, not for
+     * checkbox/radio/native select, where linters flag it and screen readers may
+     * mis-announce it. `disabled` alone conveys the non-interactive state.
+     * U6: only the bridge's own read-only disabling is reversible. A control the
+     * author intentionally shipped `disabled` (e.g. a not-yet-open option) must
+     * stay disabled — so we mark the ones WE disable (data-afy-disabled) and only
+     * ever remove `disabled` from those, never from author-disabled controls.
+     */
+    function setDisabled() {
+        const controls = keyedControls();
+        for (let i = 0; i < controls.length; i++) {
+            const el = controls[i];
+            if (!writable(el)) {
+                if (!el.hasAttribute('disabled')) {
+                    el.setAttribute('disabled', '');
+                    el.setAttribute('data-afy-disabled', '');
+                }
+            }
+            else if (el.hasAttribute('data-afy-disabled')) {
+                el.removeAttribute('disabled');
+                el.removeAttribute('data-afy-disabled');
+            }
+        }
+    }
+    /*
+     * A stamp shows WHO/WHEN, but only while the cell is "set" — otherwise an
+     * unchecked sign-off would still read "by <alias>" because that alias is
+     * still the last writer (it just wrote "false"). For a BOOL the cell is set
+     * iff value==="true"; for anything else iff the value is non-empty. When not
+     * set we blank the span so the author CSS (:has(.by:empty)) hides the row.
+     */
+    function isSet(key) {
+        const el = document.querySelector('[' + STATE_KEY + '="' + (window.CSS && CSS.escape ? CSS.escape(key) : key) + '"]');
+        const v = values[key];
+        if (el && controlKind(el) === 'bool')
+            return v === 'true';
+        return v != null && v !== '';
+    }
+    /*
+     * The -by/-at attributes name a DISPLAY span ("by <alias>") whose attribute
+     * VALUE is the state-key to show. Two guards keep a misuse from destroying a
+     * control: (1) a bare/empty attribute (key="") is skipped — it addresses no
+     * cell; (2) we NEVER write textContent onto an element that is itself a state
+     * control (hasAttribute STATE_KEY). Without guard (2), a select/textarea that
+     * also carries a bare -by would have its children (its options / text) wiped
+     * by textContent="", leaving an empty, unpickable control that can never write
+     * state. (An input has no children so it was silently unharmed, which is why
+     * only selects/textareas broke.)
+     */
+    function attribution() {
+        const byEls = document.querySelectorAll('[' + BY_ATTR + ']');
+        for (let i = 0; i < byEls.length; i++) {
+            const byEl = byEls[i];
+            if (byEl.hasAttribute(STATE_KEY))
+                continue;
+            const key = byEl.getAttribute(BY_ATTR);
+            if (!key)
+                continue;
+            const m = meta[key];
+            byEl.textContent = isSet(key) && m && m.by ? m.by : '';
+        }
+        const atEls = document.querySelectorAll('[' + AT_ATTR + ']');
+        for (let j = 0; j < atEls.length; j++) {
+            const atEl = atEls[j];
+            if (atEl.hasAttribute(STATE_KEY))
+                continue;
+            const key = atEl.getAttribute(AT_ATTR);
+            if (!key)
+                continue;
+            const m = meta[key];
+            const iso = isSet(key) && m && m.at ? m.at : '';
+            atEl.textContent = iso ? iso.slice(0, 10) : '';
+            if (iso) {
+                atEl.setAttribute('title', iso);
+                if (atEl.tagName === 'TIME')
+                    atEl.setAttribute('datetime', iso);
+            }
+            else {
+                atEl.removeAttribute('title');
+                if (atEl.tagName === 'TIME')
+                    atEl.removeAttribute('datetime');
+            }
+        }
+    }
+    function escapeHtml(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+    /** Render each poll element from its aggregate: a row per option with a bar. */
+    function renderPolls() {
+        const pollEls = document.querySelectorAll('[' + POLL_ATTR + ']');
+        for (let i = 0; i < pollEls.length; i++) {
+            const el = pollEls[i];
+            const agg = aggregates[el.getAttribute(POLL_ATTR)];
+            if (!agg) {
+                el.textContent = '';
+                continue;
+            }
+            const dist = agg.distribution || {};
+            const total = +agg.totalCount || 0;
+            let html = '';
+            for (const option in dist) {
+                if (!Object.prototype.hasOwnProperty.call(dist, option))
+                    continue;
+                // Coerce counts to numbers before they touch innerHTML (defense-in-depth:
+                // the server types them as Integer, but never trust an upstream count).
+                const count = +dist[option] || 0;
+                const pct = total > 0 ? Math.round((count * 100) / total) : 0;
+                html +=
+                    '<div class="afy-poll-row" style="display:flex;align-items:center;gap:8px;margin:4px 0">' +
+                        '<span class="afy-poll-label" style="min-width:8ch">' +
+                        escapeHtml(option) +
+                        '</span>' +
+                        '<span class="afy-poll-bar" style="flex:1;height:10px;background:rgba(0,0,0,0.08);border-radius:5px;overflow:hidden">' +
+                        '<span style="display:block;height:100%;width:' +
+                        pct +
+                        '%;background:currentColor;opacity:0.55"></span></span>' +
+                        '<span class="afy-poll-count">' +
+                        count +
+                        ' (' +
+                        pct +
+                        '%)</span></div>';
+            }
+            html +=
+                '<div class="afy-poll-total" style="opacity:0.7;font-size:0.85em;margin-top:4px">' + total + ' total</div>';
+            el.innerHTML = html;
+        }
+    }
+    /*
+     * Render each roster element from its aggregate's per-writer entries: one row
+     * per writer (alias + their value). Only attributable aggregates carry
+     * `entries` — for an anonymous key the server omits them, so a roster on an
+     * anon key shows the count only (it can never reveal a name even if asked).
+     */
+    function renderRosters() {
+        const rosterEls = document.querySelectorAll('[' + ROSTER_ATTR + ']');
+        for (let i = 0; i < rosterEls.length; i++) {
+            const el = rosterEls[i];
+            const agg = aggregates[el.getAttribute(ROSTER_ATTR)];
+            if (!agg) {
+                el.textContent = '';
+                continue;
+            }
+            const entries = agg.entries;
+            let html = '';
+            if (entries && entries.length) {
+                for (let j = 0; j < entries.length; j++) {
+                    const entry = entries[j];
+                    html +=
+                        '<div class="afy-roster-row" style="display:flex;gap:8px;margin:3px 0">' +
+                            '<span class="afy-roster-alias">' +
+                            escapeHtml(entry.alias) +
+                            '</span>' +
+                            // For a BOOL read-receipt the value is always "true" — show just the
+                            // alias; for anything else (an RSVP) show the chosen value too.
+                            (entry.value !== 'true'
+                                ? '<span class="afy-roster-value" style="opacity:0.7">' + escapeHtml(entry.value) + '</span>'
+                                : '') +
+                            '</div>';
+                }
+            }
+            else {
+                html =
+                    '<div class="afy-roster-count">' +
+                        (+agg.totalCount || 0) +
+                        (agg.anonymous ? ' (anonymous)' : '') +
+                        '</div>';
+            }
+            el.innerHTML = html;
+        }
+    }
+    /*
+     * Mirror a key's current value into every -show display. The value lives in
+     * `values` (the shared source of truth), so a control writing the key and a
+     * readout/bar showing it cannot drift. Same guards as attribution(): skip an
+     * element that is itself a state control, skip a bare/empty key. We set the
+     * numeric part as the `--afy-state` CSS var + `data-afy-state-value` attr (so a
+     * bar binds with width:calc(var(--afy-state)*1%) — no JS); and set textContent
+     * ONLY when the element has no element children, so a bar wrapping an inner
+     * fill <span> keeps its children (never re-introduce the textContent-wipe bug).
+     */
+    function renderShows() {
+        const showEls = document.querySelectorAll('[' + SHOW_ATTR + ']');
+        for (let i = 0; i < showEls.length; i++) {
+            const showEl = showEls[i];
+            if (showEl.hasAttribute(STATE_KEY))
+                continue;
+            const key = showEl.getAttribute(SHOW_ATTR);
+            if (!key)
+                continue;
+            const v = Object.prototype.hasOwnProperty.call(values, key) ? values[key] : null;
+            const sv = v == null ? '' : String(v);
+            showEl.setAttribute('data-afy-state-value', sv);
+            const num = parseFloat(sv);
+            showEl.style.setProperty('--afy-state', isNaN(num) ? '0' : String(num));
+            if (!showEl.firstElementChild)
+                showEl.textContent = sv;
+        }
+    }
+    /*
+     * ONE guard, shared by both inbound paths. It used to live only on the
+     * `-update` branch, and `hydrate()` applied values unconditionally -- which
+     * was the whole bug: the HOST re-posts `artifactory-state-init` whenever the
+     * entry list changes (ArtifactViewer re-inits after the refetch that follows
+     * any write), so a co-editor's edit arrived through the UNGUARDED door. A
+     * user typing mid-sentence had the field overwritten and the caret thrown to
+     * the end. Reproduced against a DOM stub: caret 10 -> 27, text replaced,
+     * field still focused. Duplicating the condition is how the two paths
+     * drifted apart, so there is now exactly one.
+     *
+     * What must be REFUSED, as opposed to what must merely not move the caret.
+     *
+     * Focus alone is NOT a reason to refuse. Refusing on focus was a bad fix for
+     * the caret jump: it stopped the field updating at all, so a viewer with the
+     * cursor parked in a field silently stopped seeing co-editors -- trading a
+     * cosmetic bug for a correctness one. The caret is now preserved inside
+     * applyTo, so a focused field can accept remote text safely.
+     *
+     * Only genuinely UNSAVED local text is refused: overwriting it would destroy
+     * work the person can still see on screen.
+     */
+    function keepLocal(el, key, incoming) {
+        if (controlKind(el) !== 'text')
+            return false;
+        // A local edit typed but not yet sent (600ms debounce). Losing this eats a
+        // half-typed sentence.
+        if (dirty[key])
+            return true;
+        // A no-op write still fires a synthetic input/change pair into author JS and
+        // can disturb the selection for nothing.
+        return el.value === (incoming == null ? '' : incoming);
+    }
+    function hydrate() {
+        const controls = keyedControls();
+        for (let i = 0; i < controls.length; i++) {
+            const el = controls[i];
+            const key = el.getAttribute(STATE_KEY);
+            // Per-user controls hydrate from the aggregate's myValue (the caller's own
+            // choice); shared controls from the shared value map.
+            if (isPerUser(el)) {
+                const agg = aggregates[key];
+                if (agg && agg.myValue != null && !keepLocal(el, key, agg.myValue))
+                    applyTo(el, agg.myValue);
+            }
+            else if (Object.prototype.hasOwnProperty.call(values, key) && !keepLocal(el, key, values[key])) {
+                applyTo(el, values[key]);
+            }
+        }
+        // setDisabled/attribution/polls/rosters/shows are always safe: they touch
+        // chrome and read-only displays, never the value of a control being edited.
+        setDisabled();
+        attribution();
+        renderPolls();
+        renderRosters();
+        renderShows();
+    }
+    function send(el) {
+        const key = el.getAttribute(STATE_KEY);
+        if (!key)
+            return;
+        const read = readFrom(el);
+        const msg = { type: 'artifactory-state-change', stateKey: key, valueType: read.valueType, value: read.value };
+        if (isPerUser(el)) {
+            msg.scope = 'PER_USER';
+            msg.anon = isAnon(el);
+            const ttl = parseInt(el.getAttribute(TTL_ATTR) || '', 10);
+            if (!isNaN(ttl) && ttl > 0)
+                msg.ttlSeconds = ttl;
+        }
+        values[key] = read.value;
+        // Optimistic local attribution: the current user is now the last writer, so
+        // the stamp reflects the edit immediately (a check shows the name now, not
+        // only after the server echo) and an uncheck clears it (isSet() is false).
+        // A3: never stamp the alias for an anonymous widget — the server strips it,
+        // but the local optimistic path would otherwise paint the voter's own alias
+        // on an anonymous poll (a privacy-intent break, even if local-only).
+        if (myAlias && !isAnon(el))
+            meta[key] = { by: myAlias, at: new Date().toISOString() };
+        attribution();
+        renderShows();
+        post(msg);
+    }
+    /*
+     * Write-back listeners react ONLY to genuine user edits (e.isTrusted). The
+     * synthetic input/change events that applyTo()/fireSyntheticEvents() dispatch
+     * carry isTrusted=false, so they drive author readouts without looping back
+     * into a write (which would re-send every hydrated value to the server).
+     */
+    document.addEventListener('change', (e) => {
+        if (!e.isTrusted)
+            return;
+        const el = e.target;
+        if (!el || !el.getAttribute || !el.getAttribute(STATE_KEY))
+            return;
+        if (!writable(el) || controlKind(el) === 'text')
+            return;
+        send(el);
+    }, true);
+    /*
+     * A text edit is DIRTY from the first keystroke until its debounced save
+     * actually fires. During that window a remote value must not overwrite the
+     * field: the 600ms gap is exactly long enough for a co-editor's update to
+     * arrive and wipe a half-typed sentence, and the `activeElement` guard below
+     * does not cover it (the author may have tabbed away with the save pending).
+     */
+    document.addEventListener('input', (e) => {
+        if (!e.isTrusted)
+            return;
+        const el = e.target;
+        if (!el || !el.getAttribute || !el.getAttribute(STATE_KEY))
+            return;
+        if (!writable(el) || controlKind(el) !== 'text')
+            return;
+        const key = el.getAttribute(STATE_KEY);
+        dirty[key] = true;
+        clearTimeout(saveTimers[key]);
+        saveTimers[key] = setTimeout(() => {
+            delete dirty[key];
+            send(el);
+        }, 600);
+    }, true);
+    window.addEventListener('message', (e) => {
+        const d = e.data;
+        if (!d)
+            return;
+        if (d.type === 'artifactory-state-init') {
+            canWrite = !!d.canWrite;
+            canInteract = !!d.canInteract;
+            myAlias = d.myAlias || null;
+            values = {};
+            meta = {};
+            aggregates = {};
+            const entries = d.entries || [];
+            for (let i = 0; i < entries.length; i++) {
+                const entry = entries[i];
+                if (entry && entry.stateKey != null) {
+                    values[entry.stateKey] = entry.value;
+                    meta[entry.stateKey] = { by: entry.updatedBy, at: entry.updatedAt };
+                }
+            }
+            const aggs = d.aggregates || [];
+            for (let j = 0; j < aggs.length; j++) {
+                const agg = aggs[j];
+                if (agg && agg.stateKey != null) {
+                    aggregates[agg.stateKey] = agg;
+                    // U7: hydrate the per-user -by/-at stamp on load. For an attributable
+                    // key the aggregate carries per-writer `entries`; surface THIS viewer's
+                    // own row (by myAlias) as the stamp + value, so an attributable
+                    // per-user widget shows "you, <date>" before this viewer writes again.
+                    // Anonymous keys carry no entries, so nothing is stamped (privacy
+                    // preserved).
+                    if (myAlias && agg.entries && agg.entries.length) {
+                        for (let k = 0; k < agg.entries.length; k++) {
+                            const entry = agg.entries[k];
+                            if (entry && entry.alias === myAlias) {
+                                values[agg.stateKey] = entry.value;
+                                meta[agg.stateKey] = { by: entry.alias, at: entry.updatedAt };
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            hydrate();
+        }
+        else if (d.type === 'artifactory-state-update') {
+            if (d.stateKey != null) {
+                values[d.stateKey] = d.value;
+                // Never bind an alias to a key the server holds as an anonymous
+                // aggregate — even if an echo carries updatedBy, an anonymous poll must
+                // not paint a name.
+                const agg = aggregates[d.stateKey];
+                if ((d.updatedBy != null || d.updatedAt != null) && !(agg && agg.anonymous)) {
+                    meta[d.stateKey] = { by: d.updatedBy, at: d.updatedAt };
+                }
+                /*
+                 * Do not stomp a field the user is actively typing in: re-applying
+                 * el.value on the focused element jumps the caret and can overwrite
+                 * in-flight keystrokes.
+                 *
+                 * keepLocal's three guards each cover a case the others miss:
+                 *   activeElement  the field has focus right now (caret preserved
+                 *                  inside applyTo rather than refused here).
+                 *   dirty[key]     a local edit is typed but not yet sent. The
+                 *                  `activeElement` check alone leaves a 600ms hole:
+                 *                  type, tab away, and a co-editor's value overwrites
+                 *                  the pending text. Verified by driving two iframes
+                 *                  against this exact script -- an unsaved 20-character
+                 *                  sentence survived only because it happened to win
+                 *                  the race, which is not a guarantee.
+                 *   same value     applyTo() assigns el.value unconditionally, and
+                 *                  assigning even an IDENTICAL string to a text control
+                 *                  is not always free: engines may collapse the
+                 *                  selection, and it fires a synthetic input/change
+                 *                  pair into author JS for no reason. Skipping a no-op
+                 *                  write is strictly better.
+                 */
+                const controls = keyedControls();
+                for (let k = 0; k < controls.length; k++) {
+                    const target = controls[k];
+                    if (target.getAttribute(STATE_KEY) !== d.stateKey || isPerUser(target))
+                        continue;
+                    if (keepLocal(target, d.stateKey, d.value))
+                        continue;
+                    applyTo(target, d.value);
+                }
+                attribution();
+                renderShows();
+            }
+        }
+    });
+    /*
+     * Announce readiness exactly once (on DOMContentLoaded, or immediately if the
+     * document already finished parsing). The bridge hydrates the widgets present
+     * at that point; it does not observe later DOM mutations.
+     */
+    function announce() {
+        if (announced)
+            return;
+        announced = true;
+        post({ type: 'artifactory-state-ready' });
+    }
+    if (document.readyState === 'loading')
+        document.addEventListener('DOMContentLoaded', announce);
+    else
+        announce();
+})();</script>
+<!-- __artifactory_comment_bridge__ -->
+<script>(function commentBridgeImpl() {
+    /** Prefix/suffix context captured around a selection, in characters. */
+    const CONTEXT_CHARS = 48;
+    const OVERLAY_ID = '__artifactory_comment_overlay';
+    let anchors = [];
+    let activeId = null;
+    let commentMode = false;
+    /** commentId -> the live Range its anchor resolved to (rebuilt by locateAll). */
+    let ranges = {};
+    let resizeTimer;
+    function root() {
+        return document.body || document.documentElement;
+    }
+    /** True when a text node sits inside markup that never renders as text. */
+    function inNonRenderedContainer(node) {
+        let p = node.parentNode;
+        while (p) {
+            const tag = p.nodeName;
+            if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT')
+                return true;
+            p = p.parentNode;
+        }
+        return false;
+    }
+    /** Flatten every rendered text node into one string, keeping offsets. */
+    function buildTextMap() {
+        const walker = document.createTreeWalker(root(), NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                return inNonRenderedContainer(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+            },
+        });
+        const nodes = [];
+        let text = '';
+        let n;
+        while ((n = walker.nextNode())) {
+            const t = n;
+            nodes.push({ node: t, start: text.length });
+            text += t.data;
+        }
+        return { text, nodes };
+    }
+    /**
+     * DOM point -> offset in the flattened text (-1 when the point is unusable).
+     *
+     * Must be resolved through the same map the quote is sliced from. Measuring
+     * with `range.toString().length` instead counts SCRIPT/STYLE/NOSCRIPT text
+     * that buildTextMap rejects, so every offset below an in-body <style> or
+     * <script> block drifts forward by the length of that hidden text — the
+     * quote comes back the right length and the wrong text, and `occurrence`
+     * counts matches against a position that does not exist in the map.
+     */
+    function pointToOffset(map, node, offset) {
+        // Numeric literal, not Node.TEXT_NODE: this script is serialized and run in
+        // contexts (the unit harness's stub DOM) that define no global `Node`.
+        if (node.nodeType === 3) {
+            // The map already knows where this text node starts.
+            for (let i = 0; i < map.nodes.length; i++) {
+                if (map.nodes[i].node === node)
+                    return map.nodes[i].start + offset;
+            }
+            return -1; // point sits inside skipped (non-rendered) text
+        }
+        // Element point: `offset` is a child index. Snap to the first *mapped* text
+        // node at or after it, in tree order.
+        const order = textNodesInOrder(root(), []);
+        let i = countTextNodesBefore(node, offset);
+        for (; i < order.length; i++) {
+            for (let j = 0; j < map.nodes.length; j++) {
+                // Skipped nodes are absent from the map, so a point sitting just before
+                // a <style> block lands on the first rendered text after it.
+                if (map.nodes[j].node === order[i])
+                    return map.nodes[j].start;
+            }
+        }
+        // map.text is gapless, so the last mapped node's end is the document's end.
+        return map.text.length;
+    }
+    /** Every text node under `n` in document order, skip filter NOT applied. */
+    function textNodesInOrder(n, out) {
+        if (n.nodeType === 3) {
+            out.push(n);
+            return out;
+        }
+        const kids = n.childNodes;
+        for (let i = 0; i < kids.length; i++)
+            textNodesInOrder(kids[i], out);
+        return out;
+    }
+    /**
+     * How many text nodes (unfiltered) start strictly before the element point
+     * (`node`, `offset`) — i.e. that point's index into textNodesInOrder(root()).
+     */
+    function countTextNodesBefore(node, offset) {
+        let count = 0;
+        let done = false;
+        function visit(n) {
+            if (done)
+                return;
+            if (n === node) {
+                // Reached the point's own element: only its first `offset` children
+                // precede the point.
+                const kids = n.childNodes;
+                for (let i = 0; i < offset && i < kids.length; i++) {
+                    visit(kids[i]);
+                    if (done)
+                        return;
+                }
+                done = true;
+                return;
+            }
+            if (n.nodeType === 3) {
+                count++;
+                return;
+            }
+            const kids = n.childNodes;
+            for (let i = 0; i < kids.length; i++) {
+                visit(kids[i]);
+                if (done)
+                    return;
+            }
+        }
+        visit(root());
+        return count;
+    }
+    /**
+     * Offset in the flattened text -> DOM point. A range START at an exact node
+     * boundary must bias forward (start of the next node) — else an anchor
+     * beginning at char 0 of a block resolves to the tail of the previous text
+     * node (often an inter-block newline parented by the body), and
+     * scroll-to-comment scrolls the page top instead.
+     */
+    function offsetToPoint(map, offset, biasForward) {
+        for (let i = 0; i < map.nodes.length; i++) {
+            const entry = map.nodes[i];
+            const end = entry.start + entry.node.data.length;
+            if (offset < end || (offset === end && !biasForward)) {
+                return { node: entry.node, offset: Math.max(0, offset - entry.start) };
+            }
+        }
+        const last = map.nodes[map.nodes.length - 1];
+        return last ? { node: last.node, offset: last.node.data.length } : null;
+    }
+    function rangeFor(map, start, end) {
+        const a = offsetToPoint(map, start, true);
+        const b = offsetToPoint(map, end, false);
+        if (!a || !b)
+            return null;
+        const r = document.createRange();
+        try {
+            r.setStart(a.node, a.offset);
+            r.setEnd(b.node, b.offset);
+        }
+        catch (_e) {
+            return null;
+        }
+        return r;
+    }
+    function post(msg) {
+        try {
+            parent.postMessage(msg, '*');
+        }
+        catch (_e) {
+            /* parent gone or blocked; nothing useful to do */
+        }
+    }
+    /** Length of the common suffix of `a` and `b` (compared from the ends). */
+    function commonSuffixLen(a, b) {
+        let i = 0;
+        while (i < a.length && i < b.length && a[a.length - 1 - i] === b[b.length - 1 - i])
+            i++;
+        return i;
+    }
+    /** Length of the common prefix of `a` and `b`. */
+    function commonPrefixLen(a, b) {
+        let i = 0;
+        while (i < a.length && i < b.length && a[i] === b[i])
+            i++;
+        return i;
+    }
+    /**
+     * Whitespace-tolerant: each run of whitespace in the quote matches any run
+     * of whitespace in the text, so source line-wrapping/indentation between
+     * words (which lands in the rendered text node as newline + spaces) doesn't
+     * defeat an otherwise-exact match.
+     */
+    function quoteRegex(quote) {
+        const escaped = quote.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+        return new RegExp(escaped, 'g');
+    }
+    function candidatesFor(text, anchor) {
+        const re = quoteRegex(anchor.quote);
+        const out = [];
+        let m;
+        while ((m = re.exec(text)) !== null) {
+            const idx = m.index;
+            const len = m[0].length;
+            const before = text.slice(Math.max(0, idx - CONTEXT_CHARS), idx);
+            const after = text.slice(idx + len, idx + len + CONTEXT_CHARS);
+            out.push({
+                i: idx,
+                l: len,
+                ctx: commonSuffixLen(anchor.prefix || '', before) + commonPrefixLen(anchor.suffix || '', after),
+                ord: out.length,
+            });
+            if (len === 0)
+                re.lastIndex++;
+        }
+        return out;
+    }
+    /**
+     * Find where an anchor's quote sits in the flattened text.
+     *
+     *  - anchor WITHOUT `occurrence` (the legacy contract): fast path when the
+     *    recorded offsets still hold; else the highest score of (context overlap
+     *    − offset distance/100), a tie keeping the earliest match. This branch
+     *    must stay byte-for-byte equivalent to the shipped behavior — old
+     *    anchors may never resolve differently than they did.
+     *  - anchor WITH `occurrence` (the going-forward contract): ALWAYS the full
+     *    scan, resolved lexicographically — best context overlap, then nearest
+     *    ordinal to `occurrence`, then nearest offset to `startOffset`, then
+     *    earliest. A total, deterministic order even when one phrase repeats a
+     *    hundred times. The exact-offset fast path is deliberately not trusted
+     *    here: in repeated text a stale offset can land exactly on the WRONG
+     *    copy and the slice still matches the quote.
+     *
+     * Returns the match index and MATCHED length (which may differ from
+     * quote.length), or null when orphaned.
+     */
+    function locateQuote(text, anchor) {
+        if (typeof anchor.occurrence !== 'number' && text.slice(anchor.startOffset, anchor.endOffset) === anchor.quote) {
+            return { i: anchor.startOffset, l: anchor.quote.length };
+        }
+        const candidates = candidatesFor(text, anchor);
+        if (candidates.length === 0)
+            return null;
+        if (typeof anchor.occurrence === 'number') {
+            const occurrence = anchor.occurrence;
+            let best = candidates[0];
+            for (let i = 1; i < candidates.length; i++) {
+                const c = candidates[i];
+                if (c.ctx !== best.ctx) {
+                    if (c.ctx > best.ctx)
+                        best = c;
+                    continue;
+                }
+                const cOrd = Math.abs(c.ord - occurrence);
+                const bOrd = Math.abs(best.ord - occurrence);
+                if (cOrd !== bOrd) {
+                    if (cOrd < bOrd)
+                        best = c;
+                    continue;
+                }
+                if (Math.abs(c.i - anchor.startOffset) < Math.abs(best.i - anchor.startOffset))
+                    best = c;
+            }
+            return { i: best.i, l: best.l };
+        }
+        let best = null;
+        let bestScore = -1e9;
+        for (let i = 0; i < candidates.length; i++) {
+            const c = candidates[i];
+            const score = c.ctx - Math.abs(c.i - anchor.startOffset) / 100;
+            if (score > bestScore) {
+                bestScore = score;
+                best = c;
+            }
+        }
+        return best ? { i: best.i, l: best.l } : null;
+    }
+    /** Re-resolve every anchor against the current DOM into `ranges`. */
+    function locateAllAnchors() {
+        ranges = {};
+        const map = buildTextMap();
+        for (let i = 0; i < anchors.length; i++) {
+            const a = anchors[i];
+            if (!a.anchor)
+                continue;
+            const found = locateQuote(map.text, a.anchor);
+            if (!found)
+                continue;
+            const r = rangeFor(map, found.i, found.i + found.l);
+            if (r)
+                ranges[a.commentId] = r;
+        }
+    }
+    /**
+     * Overlay-rectangle highlighter: absolutely-positioned, click-through divs in
+     * document coordinates (rect + scroll offset) so they stay glued to the text
+     * as the page scrolls — no CSS Custom Highlight API needed, works on any
+     * browser, and never mutates the artifact content itself.
+     */
+    function overlayEl() {
+        let overlay = document.getElementById(OVERLAY_ID);
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.id = OVERLAY_ID;
+            overlay.style.cssText = 'position:absolute;top:0;left:0;width:0;height:0;pointer-events:none;z-index:2147483646;';
+            (document.body || document.documentElement).appendChild(overlay);
+        }
+        return overlay;
+    }
+    function drawHighlights() {
+        const overlay = overlayEl();
+        overlay.textContent = '';
+        if (!commentMode)
+            return;
+        const scrollX = window.pageXOffset || 0;
+        const scrollY = window.pageYOffset || 0;
+        for (const id in ranges) {
+            const rects = ranges[id].getClientRects();
+            const color = id === activeId ? 'rgba(255,153,0,0.40)' : 'rgba(0,176,255,0.22)';
+            for (let j = 0; j < rects.length; j++) {
+                const rc = rects[j];
+                if (rc.width <= 0 || rc.height <= 0)
+                    continue;
+                const d = document.createElement('div');
+                d.style.cssText =
+                    'position:absolute;border-radius:2px;left:' +
+                        (rc.left + scrollX) +
+                        'px;top:' +
+                        (rc.top + scrollY) +
+                        'px;width:' +
+                        rc.width +
+                        'px;height:' +
+                        rc.height +
+                        'px;background:' +
+                        color +
+                        ';';
+                overlay.appendChild(d);
+            }
+        }
+    }
+    window.addEventListener('resize', () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(drawHighlights, 150);
+    });
+    /** Tell the parent which anchors resolved and which are orphaned. */
+    function postLocated() {
+        if (!commentMode)
+            return;
+        const located = [];
+        const orphaned = [];
+        for (let i = 0; i < anchors.length; i++) {
+            const a = anchors[i];
+            if (!a.anchor)
+                continue;
+            (ranges[a.commentId] ? located : orphaned).push(a.commentId);
+        }
+        post({ type: 'artifactory-comment-located', located, orphaned });
+    }
+    function rerender() {
+        locateAllAnchors();
+        drawHighlights();
+        postLocated();
+    }
+    // Self-heal: re-locate when the DOM changes (lazy/late content). Debounced,
+    // and only while in comment mode; characterData+childList only (canvas/WebGL
+    // attribute churn does not fire this), so a heavy page does not thrash.
+    let observer = null;
+    let observerTimer;
+    function startObserving() {
+        if (observer || !window.MutationObserver)
+            return;
+        observer = new MutationObserver(() => {
+            if (!commentMode)
+                return;
+            clearTimeout(observerTimer);
+            observerTimer = setTimeout(rerender, 300);
+        });
+        try {
+            observer.observe(root(), { childList: true, subtree: true, characterData: true });
+        }
+        catch (_e) {
+            /* detached root; the next mode toggle retries */
+        }
+    }
+    function stopObserving() {
+        if (observer) {
+            try {
+                observer.disconnect();
+            }
+            catch (_e) {
+                /* already dead */
+            }
+            observer = null;
+        }
+    }
+    // Only capture selections-as-anchors while in comment mode (drawer open).
+    // When the drawer is closed a selection must yield no comment behaviour.
+    // A cleared/unusable selection posts anchor:null so the parent can dismiss
+    // its floating "Comment" pill (and clear a pending composer anchor) when
+    // the user clicks elsewhere INSIDE the iframe — those clicks never reach
+    // the parent document's own dismiss listeners.
+    //
+    // skipNoSelection breaks a race on highlight clicks: mouseup schedules the
+    // deferred onSelection, THEN the click handler below posts comment-click and
+    // sets the flag, THEN onSelection runs — the selection is collapsed (it was
+    // a click, not a drag), and without the flag it would post anchor:null right
+    // after comment-click, clobbering parent state the click just activated
+    // (e.g. a pending composer anchor). The flag is consumed unconditionally
+    // at the top of onSelection so it can never leak into a later interaction.
+    function postNoSelection() {
+        post({ type: 'artifactory-comment-selection', anchor: null });
+    }
+    let skipNoSelection = false;
+    function onSelection() {
+        const skip = skipNoSelection;
+        skipNoSelection = false;
+        if (!commentMode)
+            return;
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+            if (!skip)
+                postNoSelection();
+            return;
+        }
+        const range = sel.getRangeAt(0);
+        if (!root().contains(range.commonAncestorContainer))
+            return postNoSelection();
+        const map = buildTextMap();
+        const start = pointToOffset(map, range.startContainer, range.startOffset);
+        const end = pointToOffset(map, range.endContainer, range.endOffset);
+        if (start < 0 || end < 0 || end <= start)
+            return postNoSelection();
+        const quote = map.text.slice(start, end);
+        if (!quote.trim())
+            return postNoSelection();
+        // Going-forward disambiguator: how many whitespace-tolerant matches of the
+        // quote precede the selection. Resolution prefers this ordinal on context
+        // ties, so a phrase repeated a hundred times still re-anchors exactly.
+        const re = quoteRegex(quote);
+        let occurrence = 0;
+        let m;
+        while ((m = re.exec(map.text)) !== null) {
+            if (m.index >= start)
+                break;
+            occurrence++;
+            if (m[0].length === 0)
+                re.lastIndex++;
+        }
+        // Selection rect in iframe-viewport coordinates so the parent can float its
+        // "Comment" pill at the selection instead of a docked fallback corner.
+        const box = range.getBoundingClientRect();
+        post({
+            type: 'artifactory-comment-selection',
+            anchor: {
+                quote,
+                prefix: map.text.slice(Math.max(0, start - CONTEXT_CHARS), start),
+                suffix: map.text.slice(end, end + CONTEXT_CHARS),
+                startOffset: start,
+                endOffset: end,
+                occurrence,
+            },
+            rect: { top: box.top, left: box.left, bottom: box.bottom, width: box.width, height: box.height },
+        });
+    }
+    document.addEventListener('mouseup', () => {
+        setTimeout(onSelection, 0);
+    }, true);
+    document.addEventListener('click', (e) => {
+        if (!commentMode)
+            return;
+        const sel = window.getSelection();
+        if (sel && !sel.isCollapsed)
+            return;
+        const ev = e;
+        const x = ev.clientX;
+        const y = ev.clientY;
+        let hit = null;
+        for (const id in ranges) {
+            const rects = ranges[id].getClientRects();
+            for (let j = 0; j < rects.length; j++) {
+                const rc = rects[j];
+                if (x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom) {
+                    hit = id;
+                    break;
+                }
+            }
+            if (hit)
+                break;
+        }
+        if (hit) {
+            e.preventDefault();
+            e.stopPropagation();
+            // The click event fires before the mouseup-scheduled onSelection timeout
+            // runs, so setting the flag here reliably suppresses that one
+            // anchor:null post.
+            skipNoSelection = true;
+            post({ type: 'artifactory-comment-click', commentId: hit });
+        }
+    }, true);
+    window.addEventListener('message', (e) => {
+        const d = e.data;
+        if (!d)
+            return;
+        if (d.type === 'artifactory-comment-highlights') {
+            anchors = d.anchors || [];
+            activeId = d.activeId || null;
+            rerender();
+        }
+        else if (d.type === 'artifactory-comment-mode') {
+            commentMode = !!d.enabled;
+            if (commentMode)
+                startObserving();
+            else
+                stopObserving();
+            rerender();
+        }
+        else if (d.type === 'artifactory-comment-scrollto') {
+            const r = ranges[d.commentId];
+            if (r) {
+                let el = r.startContainer;
+                if (el && el.nodeType !== 1)
+                    el = el.parentElement;
+                if (el && el.scrollIntoView) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            }
+        }
+    });
+    // Overlay needs no special browser API, so highlighting is always supported.
+    post({ type: 'artifactory-comment-ready', highlightsSupported: true });
+})();</script>
+<!-- __artifactory_anchor_fix__ -->
+<script>(function(){document.addEventListener("click",function(e){var a=e.target&&e.target.closest&&e.target.closest('a[href^="#"]');if(!a||a.hasAttribute("target"))return;var href=a.getAttribute("href");if(!href||href==="#")return;var id=href.slice(1);var el=document.getElementById(id)||document.querySelector('[name="'+CSS.escape(id)+'"]');if(!el)return;e.preventDefault();el.scrollIntoView({behavior:"smooth",block:"start"});try{history.pushState(null,"","#"+id);}catch(_){}},true);})();</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Argha Banik — Client Operations Portfolio</title>
+<base target="_blank">
+<!-- __artifactory_house_style__ -->
+<style>
+/* Artifactory house structure sheet — MECHANICS ONLY. __artifactory_house_style__ */
+/* The token fallbacks below are deliberately drab: set your own. */
+*, *::before, *::after { box-sizing: border-box; }
+:root {
+  --ink: #1c1c1c;
+  --paper: #ffffff;
+  --mute: #595959;
+  --accent: #1c1c1c;
+  --line: #d6d6d6;
+  --panel: #f4f4f4;
+  --font: system-ui, sans-serif;
+  --mono: ui-monospace, monospace;
+  --s1: .25rem; --s2: .5rem; --s3: .75rem; --s4: 1rem;
+  --s5: 1.5rem; --s6: 2rem; --s7: 3rem;
+}
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font);
+  line-height: 1.55;
+}
+img, svg, video, canvas { display: block; max-width: 100%; height: auto; }
+h1, h2, h3 { text-wrap: balance; }
+p, li { text-wrap: pretty; }
+code, pre, kbd, samp { font-family: var(--mono); }
+/* Table mechanics — the shape 73% of the corpus builds by hand. */
+.afy-table { border-collapse: collapse; width: 100%; }
+.afy-table caption { text-align: left; color: var(--mute); padding-bottom: var(--s3); }
+.afy-table th, .afy-table td { padding: var(--s2) var(--s3); border-bottom: 1px solid var(--line); }
+.afy-table th { text-align: left; font-weight: 600; }
+.afy-table thead th { border-bottom: 2px solid var(--mute); }
+.afy-table .num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+/* The rule behind data-sticky. The fallback sheet in tables.py defines it too:
+   the class is emitted by the expander, so leaving it undefined here made
+   data-sticky a silent no-op in a document that did not opt into this sheet. */
+.afy-table-sticky thead th { position: sticky; top: 0; background: var(--paper); }
+/* Chart mechanics — static SVG, colored from the document's own tokens. */
+.afy-chart { display: block; width: 100%; height: auto; overflow: visible; }
+.afy-chart .afy-axis { stroke: var(--line); }
+.afy-chart .afy-tick { fill: var(--mute); font-family: var(--mono); font-size: 10px; }
+.afy-chart .afy-label { fill: var(--mute); font-family: var(--font); font-size: 11px; }
+.afy-chart .afy-series-0 { fill: var(--accent); stroke: var(--accent); }
+.afy-chart .afy-series-1 { fill: var(--mute); stroke: var(--mute); }
+.afy-chart .afy-series-2 { fill: var(--ink); stroke: var(--ink); }
+/* Layout utilities: responsive without breakpoints. */
+.afy-grid { display: grid; gap: var(--s4); grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+.afy-stack > * + * { margin-top: var(--s4); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}
+@media print {
+  body { background: #ffffff; color: #000000; }
+  .afy-table thead { display: table-header-group; }
+  .afy-table tr, .afy-chart { break-inside: avoid; }
+}
+</style>
+<style>
+  :root{
+    /* Ops console — graphite paper, signal teal (Committed-Restrained) */
+    --paper:  oklch(96.4% 0.004 240);   /* cool near-white */
+    --panel:  oklch(99.2% 0.003 240);   /* raised surface */
+    --ink:    oklch(24.5% 0.018 250);   /* deep slate-navy */
+    --mute:   oklch(52.0% 0.020 250);   /* metadata, 4.6:1 */
+    --line:   oklch(88.0% 0.008 245);   /* hairline */
+    --accent: oklch(52.0% 0.108 205);   /* signal teal, ~4.9:1 */
+    --accent-weak: oklch(from var(--accent) l calc(c * 0.30) h);
+    --wash:   color-mix(in oklch, var(--accent) 8%, var(--paper));
+    --ok:     oklch(47.5% 0.100 148);
+    --warn:   oklch(60.0% 0.120 70);
+    --font: "Segoe UI", -apple-system, "Helvetica Neue", Arial, sans-serif;
+    --mono: "SFMono-Regular", "Consolas", "Roboto Mono", ui-monospace, monospace;
+    --maxw: 1080px;
+    --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+    --ease-out-expo:  cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--font); font-size:16px; line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 clamp(20px,5vw,48px);}
+  a{color:var(--accent); text-decoration-thickness:1px; text-underline-offset:3px;}
+  h1,h2,h3{line-height:1.15; margin:0; font-weight:700; letter-spacing:-0.01em;}
+  .mono{font-family:var(--mono);}
+  .mute{color:var(--mute);}
+
+  /* ---- Masthead ---- */
+  header.mast{
+    border-bottom:1px solid var(--line);
+    background:
+      linear-gradient(var(--wash),var(--wash));
+  }
+  .mast-grid{
+    display:grid; grid-template-columns:1fr auto; gap:24px;
+    align-items:end; padding:clamp(40px,7vw,72px) 0 32px;
+  }
+  .id-line{
+    font-family:var(--mono); font-size:12px; letter-spacing:.14em;
+    text-transform:uppercase; color:var(--accent); margin-bottom:14px;
+    display:flex; align-items:center; gap:10px;
+  }
+  .id-line::before{content:"●"; font-size:9px;}
+  h1.name{font-size:clamp(34px,6vw,58px); letter-spacing:-0.02em;}
+  .tagline{font-size:clamp(16px,2.4vw,20px); color:var(--mute); margin-top:12px; max-width:52ch;}
+  .contact{
+    font-family:var(--mono); font-size:12.5px; text-align:right;
+    line-height:1.9; color:var(--mute); white-space:nowrap;
+  }
+  .contact a{color:var(--ink); text-decoration:none;}
+  .contact a:hover{color:var(--accent);}
+
+  /* ---- Status strip ---- */
+  .strip{
+    display:grid; grid-template-columns:repeat(4,1fr);
+    border-top:1px solid var(--line); border-bottom:1px solid var(--line);
+    background:var(--panel);
+  }
+  .strip .cell{padding:20px clamp(14px,2.5vw,28px); border-right:1px solid var(--line);}
+  .strip .cell:last-child{border-right:0;}
+  .strip .n{font-family:var(--mono); font-size:clamp(26px,4vw,38px); font-weight:600; color:var(--accent); letter-spacing:-0.02em;}
+  .strip .k{font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--mute); margin-top:6px;}
+
+  section{padding:clamp(44px,7vw,72px) 0;}
+  section + section{border-top:1px solid var(--line);}
+  .sec-head{display:flex; align-items:baseline; gap:16px; margin-bottom:28px;}
+  .sec-head .no{font-family:var(--mono); font-size:13px; color:var(--accent); }
+  h2{font-size:clamp(22px,3.4vw,30px);}
+  .lede{max-width:64ch; color:var(--mute); font-size:16.5px;}
+
+  /* ---- Capability domains ---- */
+  .domains{display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); border-top:1px solid var(--line); border-left:1px solid var(--line);}
+  .domain{padding:22px 24px; border-right:1px solid var(--line); border-bottom:1px solid var(--line);}
+  .domain h3{font-size:16px; margin-bottom:8px;}
+  .domain h3 .tag{font-family:var(--mono); color:var(--accent); font-weight:600; margin-right:8px;}
+  .domain p{margin:0; font-size:14.5px; color:var(--mute); line-height:1.5;}
+
+  /* ---- Experience timeline ---- */
+  .job{display:grid; grid-template-columns:210px 1fr; gap:28px; padding:26px 0; border-top:1px solid var(--line);}
+  .job:first-of-type{border-top:0;}
+  .job .when{font-family:var(--mono); font-size:12.5px; color:var(--mute); line-height:1.7;}
+  .job .when .co{display:block; color:var(--ink); font-weight:600; font-family:var(--font); font-size:15px; margin-top:6px;}
+  .job .when .loc{display:block; margin-top:2px;}
+  .job h3{font-size:17px; margin-bottom:10px;}
+  .job h3 .live{font-family:var(--mono); font-size:10.5px; color:var(--ok); border:1px solid var(--ok); border-radius:3px; padding:1px 6px; margin-left:10px; vertical-align:middle; letter-spacing:.06em; text-transform:uppercase;}
+  .job ul{margin:0; padding-left:18px;}
+  .job li{margin:0 0 8px; font-size:14.8px; line-height:1.5;}
+  .job li strong{color:var(--ink);}
+  .rolenote{font-size:13.5px; line-height:1.5; margin:0 0 12px; padding-left:12px; border-left:2px solid var(--accent-weak);}
+
+  /* ---- Skills ---- */
+  .skillcols{display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:36px;}
+  .skillcols h3{font-size:13px; text-transform:uppercase; letter-spacing:.09em; color:var(--accent); margin-bottom:14px; font-family:var(--mono);}
+  .chips{display:flex; flex-wrap:wrap; gap:8px;}
+  .chip{font-size:13px; padding:5px 11px; border:1px solid var(--line); border-radius:4px; background:var(--panel); color:var(--ink);}
+  .chip.core{border-color:var(--accent); color:var(--accent);}
+
+  /* ---- Chart / education row ---- */
+  .two{display:grid; grid-template-columns:1.3fr 1fr; gap:44px;}
+  .card{border:1px solid var(--line); background:var(--panel); padding:24px;}
+  .card h3{font-size:14px; text-transform:uppercase; letter-spacing:.08em; color:var(--mute); font-family:var(--mono); margin-bottom:16px;}
+  .edu-item{padding:12px 0; border-top:1px solid var(--line);}
+  .edu-item:first-of-type{border-top:0; padding-top:0;}
+  .edu-item .t{font-weight:600; font-size:15px;}
+  .edu-item .d{font-family:var(--mono); font-size:12.5px; color:var(--mute); margin-top:3px;}
+  .cert{font-size:14px; padding:8px 0; border-top:1px dashed var(--line); display:flex; justify-content:space-between; gap:12px;}
+  .cert:first-of-type{border-top:0;}
+  .cert .dt{font-family:var(--mono); font-size:12px; color:var(--mute);}
+
+  /* ---- Fit / CTA ---- */
+  .fit{background:var(--ink); color:var(--paper);}
+  .fit .wrap{padding:clamp(48px,8vw,80px) clamp(20px,5vw,48px);}
+  .fit h2{color:var(--paper); font-size:clamp(24px,4vw,34px); max-width:22ch; letter-spacing:-0.02em;}
+  .fit .lede{color:oklch(80% 0.02 245); max-width:60ch; margin-top:18px; font-size:17px;}
+  .fit .btnrow{margin-top:32px; display:flex; flex-wrap:wrap; gap:14px;}
+  .btn{font-family:var(--mono); font-size:13px; letter-spacing:.04em; padding:12px 20px; border:1px solid var(--accent); color:var(--ink); background:var(--accent); text-decoration:none; border-radius:4px;}
+  .btn.ghost{background:transparent; color:var(--paper); border-color:oklch(55% 0.02 245);}
+  .btn:hover{filter:brightness(1.08);}
+  .btn.ghost:hover{border-color:var(--accent); color:var(--accent);}
+
+  /* ---- Operational scorecard ---- */
+  .kpi{display:grid; grid-template-columns:repeat(4,1fr); border-top:1px solid var(--line); border-left:1px solid var(--line); margin-bottom:36px;}
+  .kpi-cell{padding:22px 22px 24px; border-right:1px solid var(--line); border-bottom:1px solid var(--line); background:var(--panel);}
+  .kpi-cell.hero{background:var(--wash); grid-column:span 1;}
+  .kpi-cell .n{font-family:var(--mono); font-size:clamp(30px,4.4vw,44px); font-weight:600; color:var(--accent); letter-spacing:-0.02em; line-height:1;}
+  .kpi-cell.hero .n{color:var(--accent);}
+  .kpi-cell .n .plus{font-size:0.5em; vertical-align:top; margin-left:1px; color:var(--mute);}
+  .kpi-cell .k{font-size:12.5px; text-transform:uppercase; letter-spacing:.07em; color:var(--ink); margin-top:12px; font-weight:600;}
+  .kpi-cell .sub{font-size:12.5px; color:var(--mute); margin-top:6px; line-height:1.45;}
+
+  .dash{display:grid; grid-template-columns:1fr 1fr; gap:20px;}
+  .panel{border:1px solid var(--line); background:var(--panel); padding:20px 22px 22px; min-width:0;}
+  .panel.wide{grid-column:1 / -1;}
+  .phead{display:flex; align-items:baseline; justify-content:space-between; gap:12px; padding-bottom:14px; margin-bottom:16px; border-bottom:1px solid var(--line); flex-wrap:wrap;}
+  .phead .ptitle{font-size:14px; font-weight:600; color:var(--ink);}
+  .phead .pmeta{font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--mute);}
+  .panel .afy-chart{max-height:230px;}
+  .pnote{font-size:12.5px; margin:14px 0 0; line-height:1.5;}
+
+  /* ---- Global motion (cadence: restrained) ---- */
+  /* One-time, transform-only entrance — visible by default, never opacity-gated,
+     so a screenshot / reduced-motion / no-JS render always shows content. */
+  @keyframes boot-in{ from{ transform:translateY(10px); } to{ transform:none; } }
+  @keyframes rule-in{ from{ transform:scaleX(0); } to{ transform:scaleX(1); } }
+  @media (prefers-reduced-motion: no-preference){
+    .boot-in{ animation:boot-in 520ms var(--ease-out-quart) both; }
+    .boot-in:nth-child(2){ animation-delay:70ms; }
+    .boot-in:nth-child(3){ animation-delay:140ms; }
+    .boot-in:nth-child(4){ animation-delay:210ms; }
+    /* Section number rules draw in once, keyed off the accent hairline motif. */
+    .sec-head .no{ display:inline-block; transform-origin:left center; animation:rule-in 600ms var(--ease-out-expo) both; }
+  }
+  @media (prefers-reduced-motion: reduce){
+    /* House sheet resets duration/iteration but not delay — zero it so no
+       staggered item flashes its start state. */
+    .boot-in, .sec-head .no{ animation-delay:0ms !important; }
+  }
+  /* Interactive affordances — color/border only (no card-lift), fast hand-eye loop. */
+  .chip{ transition:border-color 120ms var(--ease-out-quart), color 120ms var(--ease-out-quart), background-color 120ms; }
+  .chip:hover{ border-color:var(--accent); color:var(--accent); background:var(--wash); }
+  .domain{ transition:background-color 160ms var(--ease-out-quart); }
+  .domain:hover{ background:var(--wash); }
+  .panel{ transition:border-color 160ms var(--ease-out-quart); }
+  .panel:hover{ border-color:var(--accent-weak); }
+  .btn{ transition:filter 120ms var(--ease-out-quart), border-color 120ms, color 120ms, background-color 120ms; }
+  .contact a, a{ transition:color 120ms var(--ease-out-quart); }
+
+  footer{padding:26px 0; border-top:1px solid var(--line); font-family:var(--mono); font-size:12px; color:var(--mute); display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px;}
+
+  @media (max-width:720px){
+    .mast-grid{grid-template-columns:1fr;}
+    .contact{text-align:left; white-space:normal;}
+    .strip{grid-template-columns:repeat(2,1fr);}
+    .strip .cell:nth-child(2){border-right:0;}
+    .strip .cell:nth-child(1),.strip .cell:nth-child(2){border-bottom:1px solid var(--line);}
+    .job{grid-template-columns:1fr; gap:12px;}
+    .two{grid-template-columns:1fr;}
+    .kpi{grid-template-columns:repeat(2,1fr);}
+    .kpi-cell:nth-child(1),.kpi-cell:nth-child(2){border-bottom:1px solid var(--line);}
+    .dash{grid-template-columns:1fr;}
+    .panel.wide{grid-column:auto;}
+  }
+</style>
+</head>
+<body>
+
+<header class="mast">
+  <div class="wrap">
+    <div class="mast-grid">
+      <div>
+        <div class="id-line boot-in">Client Operations · Compliance · Onboarding</div>
+        <h1 class="name boot-in">Argha Banik</h1>
+        <p class="tagline boot-in">B2B operations professional who owns client-facing workflows end&#8209;to&#8209;end — SLAs, escalations, compliance gating, and reconciliation — across global, multi&#8209;region programs.</p>
+      </div>
+      <address class="contact">
+        Kolkata, West Bengal, India<br>
+        <a href="mailto:arghab2001@gmail.com">arghab2001@gmail.com</a><br>
+        <a href="https://linkedin.com/in/argha-banik-8913b8268">linkedin.com/in/argha-banik</a>
+      </address>
+    </div>
+  </div>
+  <div class="strip">
+    <div class="cell"><div class="n">9,000+</div><div class="k">Client issues resolved</div></div>
+    <div class="cell"><div class="n">3</div><div class="k">Global regions — NA · EU · APAC</div></div>
+    <div class="cell"><div class="n">98%</div><div class="k">72-hour SLA adherence</div></div>
+    <div class="cell"><div class="n">L1</div><div class="k">Escalation point</div></div>
+  </div>
+</header>
+
+<main>
+
+<section id="profile">
+  <div class="wrap">
+    <div class="sec-head"><span class="no">01</span><h2>Operating profile</h2></div>
+    <p class="lede" style="max-width:72ch; font-size:18px; color:var(--ink); line-height:1.6;">
+      I run the operational layer that sits between a business and its clients: validating who gets activated,
+      tracking that commitments are met on time, resolving the escalations when they aren't, and reconciling the
+      data so settlement and reporting stay accurate. Two years across Amazon's Brand Protection, Catalog, and
+      Compliance programs — plus insurance servicing before that — have made me the person who owns a
+      cross-functional process from intake to durable resolution, and who spots where a recurring manual task
+      should become a product requirement instead.
+    </p>
+  </div>
+</section>
+
+<section id="metrics">
+  <div class="wrap">
+    <div class="sec-head"><span class="no">02</span><h2>Operational scorecard</h2></div>
+    <p class="lede" style="margin-bottom:30px;">The numbers I'm measured on, read the way I read them on shift — throughput, adherence, and the mix of what actually crosses my queue. Figures aggregate my client-operations work from late 2024 to present across insurance servicing and Amazon compliance programs.</p>
+
+    <div class="kpi">
+      <div class="kpi-cell hero">
+        <div class="n">9,000<span class="plus">+</span></div>
+        <div class="k">Client issues resolved</div>
+        <div class="sub">Across compliance, onboarding, escalation &amp; reconciliation queues</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="n">98<span class="plus">%</span></div>
+        <div class="k">72-hour SLA adherence</div>
+        <div class="sub">Current month · up from 91% seven months ago</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="n">~350<span class="plus">/mo</span></div>
+        <div class="k">Cases at current run-rate</div>
+        <div class="sub">Peak quarter cleared 1,960</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="n">3</div>
+        <div class="k">Regions covered</div>
+        <div class="sub">NA · EU · APAC marketplaces</div>
+      </div>
+    </div>
+
+    <div class="dash">
+      <div class="panel wide">
+        <div class="phead"><span class="ptitle">Issues resolved per quarter</span><span class="pmeta mono">count · Q4 2024 → Q1 2026</span></div>
+        <!-- __artifactory_chart__ -->
+<svg class="afy-chart" viewBox="0 0 720 280" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Client issues resolved per quarter</title>
+<desc>Quarterly count of client issues resolved, rising from 980 in Q4 2024 to a peak of 1,960 in Q4 2025.</desc>
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="46" y="249" text-anchor="end">0</text>
+<line class="afy-axis" x1="52" y1="199.2" x2="708" y2="199.2" />
+<text class="afy-tick" x="46" y="202.2" text-anchor="end">392</text>
+<line class="afy-axis" x1="52" y1="152.4" x2="708" y2="152.4" />
+<text class="afy-tick" x="46" y="155.4" text-anchor="end">784</text>
+<line class="afy-axis" x1="52" y1="105.6" x2="708" y2="105.6" />
+<text class="afy-tick" x="46" y="108.6" text-anchor="end">1176</text>
+<line class="afy-axis" x1="52" y1="58.8" x2="708" y2="58.8" />
+<text class="afy-tick" x="46" y="61.8" text-anchor="end">1568</text>
+<line class="afy-axis" x1="52" y1="12" x2="708" y2="12" />
+<text class="afy-tick" x="46" y="15" text-anchor="end">1960</text>
+<rect class="afy-series-0" x="61.84" y="129" width="89.65" height="117" />
+<rect class="afy-series-0" x="171.17" y="105.12" width="89.65" height="140.88" />
+<rect class="afy-series-0" x="280.51" y="64.53" width="89.65" height="181.47" />
+<rect class="afy-series-0" x="389.84" y="38.27" width="89.65" height="207.73" />
+<rect class="afy-series-0" x="499.17" y="12" width="89.65" height="234" />
+<rect class="afy-series-0" x="608.51" y="40.65" width="89.65" height="205.35" />
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="106.67" y="260" text-anchor="middle">Q4 2024</text>
+<text class="afy-tick" x="216" y="260" text-anchor="middle">Q1 2025</text>
+<text class="afy-tick" x="325.33" y="260" text-anchor="middle">Q2 2025</text>
+<text class="afy-tick" x="434.67" y="260" text-anchor="middle">Q3 2025</text>
+<text class="afy-tick" x="544" y="260" text-anchor="middle">Q4 2025</text>
+<text class="afy-tick" x="653.33" y="260" text-anchor="middle">Q1 2026</text>
+</svg>
+        <p class="pnote mute">Volume scaled with scope — from insurance servicing queues into high-volume Amazon compliance and brand-protection operations.</p>
+      </div>
+      <div class="panel">
+        <div class="phead"><span class="ptitle">72-hour SLA adherence</span><span class="pmeta mono">%, trailing 7 mo</span></div>
+        <!-- __artifactory_chart__ -->
+<svg class="afy-chart" viewBox="0 0 720 280" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>72-hour SLA adherence, last 7 months</title>
+<desc>Share of cases resolved within the 72-hour SLA target, rising steadily from 91.4% to 98.0% over seven months.</desc>
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="46" y="249" text-anchor="end">91</text>
+<line class="afy-axis" x1="52" y1="199.2" x2="708" y2="199.2" />
+<text class="afy-tick" x="46" y="202.2" text-anchor="end">93</text>
+<line class="afy-axis" x1="52" y1="152.4" x2="708" y2="152.4" />
+<text class="afy-tick" x="46" y="155.4" text-anchor="end">94</text>
+<line class="afy-axis" x1="52" y1="105.6" x2="708" y2="105.6" />
+<text class="afy-tick" x="46" y="108.6" text-anchor="end">95</text>
+<line class="afy-axis" x1="52" y1="58.8" x2="708" y2="58.8" />
+<text class="afy-tick" x="46" y="61.8" text-anchor="end">97</text>
+<line class="afy-axis" x1="52" y1="12" x2="708" y2="12" />
+<text class="afy-tick" x="46" y="15" text-anchor="end">98</text>
+<polyline class="afy-series-0" style="fill:none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="98.86,246 192.57,189.27 286.29,146.73 380,97.09 473.71,79.36 567.43,36.82 661.14,12" />
+<circle class="afy-series-0" cx="98.86" cy="246" r="2.5" />
+<circle class="afy-series-0" cx="192.57" cy="189.27" r="2.5" />
+<circle class="afy-series-0" cx="286.29" cy="146.73" r="2.5" />
+<circle class="afy-series-0" cx="380" cy="97.09" r="2.5" />
+<circle class="afy-series-0" cx="473.71" cy="79.36" r="2.5" />
+<circle class="afy-series-0" cx="567.43" cy="36.82" r="2.5" />
+<circle class="afy-series-0" cx="661.14" cy="12" r="2.5" />
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="98.86" y="260" text-anchor="middle">Aug</text>
+<text class="afy-tick" x="192.57" y="260" text-anchor="middle">Sep</text>
+<text class="afy-tick" x="286.29" y="260" text-anchor="middle">Oct</text>
+<text class="afy-tick" x="380" y="260" text-anchor="middle">Nov</text>
+<text class="afy-tick" x="473.71" y="260" text-anchor="middle">Dec</text>
+<text class="afy-tick" x="567.43" y="260" text-anchor="middle">Jan</text>
+<text class="afy-tick" x="661.14" y="260" text-anchor="middle">Feb</text>
+</svg>
+        <p class="pnote mute">Root-causing defect surges before they breach kept adherence climbing quarter over quarter.</p>
+      </div>
+      <div class="panel">
+        <div class="phead"><span class="ptitle">Case mix by workflow</span><span class="pmeta mono">count · lifetime</span></div>
+        <!-- __artifactory_chart__ -->
+<svg class="afy-chart" viewBox="0 0 720 280" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Case volume by workflow type</title>
+<desc>Breakdown of resolved cases by workflow: compliance/IP 3,120; KYC and onboarding 2,240; L1 escalations 1,680; reconciliation 1,310; record suppression 750.</desc>
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="46" y="249" text-anchor="end">0</text>
+<line class="afy-axis" x1="52" y1="199.2" x2="708" y2="199.2" />
+<text class="afy-tick" x="46" y="202.2" text-anchor="end">624</text>
+<line class="afy-axis" x1="52" y1="152.4" x2="708" y2="152.4" />
+<text class="afy-tick" x="46" y="155.4" text-anchor="end">1248</text>
+<line class="afy-axis" x1="52" y1="105.6" x2="708" y2="105.6" />
+<text class="afy-tick" x="46" y="108.6" text-anchor="end">1872</text>
+<line class="afy-axis" x1="52" y1="58.8" x2="708" y2="58.8" />
+<text class="afy-tick" x="46" y="61.8" text-anchor="end">2496</text>
+<line class="afy-axis" x1="52" y1="12" x2="708" y2="12" />
+<text class="afy-tick" x="46" y="15" text-anchor="end">3120</text>
+<rect class="afy-series-0" x="63.81" y="12" width="107.58" height="234" />
+<rect class="afy-series-0" x="195.01" y="78" width="107.58" height="168" />
+<rect class="afy-series-0" x="326.21" y="120" width="107.58" height="126" />
+<rect class="afy-series-0" x="457.41" y="147.75" width="107.58" height="98.25" />
+<rect class="afy-series-0" x="588.61" y="189.75" width="107.58" height="56.25" />
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="117.6" y="260" text-anchor="middle">Compliance / IP</text>
+<text class="afy-tick" x="248.8" y="260" text-anchor="middle">KYC &amp; onboarding</text>
+<text class="afy-tick" x="380" y="260" text-anchor="middle">L1 escalations</text>
+<text class="afy-tick" x="511.2" y="260" text-anchor="middle">Reconciliation</text>
+<text class="afy-tick" x="642.4" y="260" text-anchor="middle">Record suppression</text>
+</svg>
+        <p class="pnote mute">Compliance and IP work is the largest share; KYC gating and L1 escalations follow.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="domains">
+  <div class="wrap">
+    <div class="sec-head"><span class="no">03</span><h2>What I own in a client-operations role</h2></div>
+    <p class="lede" style="margin-bottom:26px;">The recurring surfaces of B2B operational work — each is something I run today, not a skill in the abstract.</p>
+    <div class="domains">
+      <div class="domain"><h3><span class="tag">01</span>Onboarding &amp; KYC gating</h3><p>Validate eligibility and gating requests, confirm compliance signals are met before activation, and monitor onboarding health end to end.</p></div>
+      <div class="domain"><h3><span class="tag">02</span>SLA tracking</h3><p>Own 72-hour SLA targets, monitor health metrics on internal dashboards, and root-cause surges in defects before they breach.</p></div>
+      <div class="domain"><h3><span class="tag">03</span>Partner escalations</h3><p>Act as L1 escalation point for complex client queries, driving resolution independently across multiple stakeholders and systems.</p></div>
+      <div class="domain"><h3><span class="tag">04</span>Reconciliation</h3><p>Reconcile client and transaction data, validate matches to protect settlement accuracy, and maintain clean operational ledgers.</p></div>
+      <div class="domain"><h3><span class="tag">05</span>Compliance workflows</h3><p>Enforce program and regulatory standards, resolve IP/trademark/counterfeit cases, and flag and remove non-compliant records.</p></div>
+      <div class="domain"><h3><span class="tag">06</span>Process &amp; automation</h3><p>Identify repeatable manual work and scope clear product requirements when a recurring operational issue points to a product gap.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="experience">
+  <div class="wrap">
+    <div class="sec-head"><span class="no">04</span><h2>Experience</h2></div>
+
+    <div class="job">
+      <div class="when">Feb 2025 — Present<span class="co">Amazon</span><span class="loc">India · Global programs</span><span class="loc">Current project since Oct 2025</span></div>
+      <div>
+        <h3>Operations Associate — Brand Protection &amp; Partner Programs <span class="live">Current</span></h3>
+        <p class="rolenote mute">Transferred to this program in October 2025 within the same Amazon operations tenure — continuing SLA, escalation, and compliance ownership on a new product surface.</p>
+        <ul>
+          <li>Own <strong>end-to-end operations</strong> for a brand-protection partner program, monitoring partner and product-record compliance across NA, EU, and APAC regions and flagging errors and drop-offs to product teams for prioritisation.</li>
+          <li>Act as <strong>L1 escalation point</strong> for complex seller queries across operational products, driving resolution independently across multiple stakeholders and systems.</li>
+          <li>Track <strong>72-hour SLAs</strong>, resolve partner-facing discrepancies, and manage escalations and new integrations with legal, central program, and vendor/account-management teams.</li>
+          <li>Monitor onboarding health end to end — process and validate entity gating requests and eligibility checks, ensuring <strong>KYC-equivalent compliance signals</strong> are met before activation.</li>
+          <li>Scope clear, well-defined <strong>product requirements</strong> when recurring operational issues point to a product gap, and coordinate cross-functional processes through ticketing and case-management workflows.</li>
+          <li>Use internal dashboards and operational data to root-cause defect surges and build durable resolution paths that reduce repeat escalations.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="job">
+      <div class="when">Feb 2025 — Oct 2025<span class="co">Amazon</span><span class="loc">India · Prior project</span><span class="loc">Same tenure</span></div>
+      <div>
+        <h3>Operations Associate — Data Governance &amp; Compliance</h3>
+        <p class="rolenote mute">Earlier project in the same Amazon operations role, before the October 2025 transfer.</p>
+        <ul>
+          <li>Managed <strong>high-volume operational queues</strong> across record suppression, data governance, and compliance workflows, consistently meeting productivity, quality, and SLA metrics.</li>
+          <li>Investigated and resolved <strong>IP, trademark, and counterfeit cases</strong>, contributing to platform risk mitigation, seller compliance, and customer trust.</li>
+          <li>Validated product-record matches to prevent duplication and incorrect entries — protecting <strong>transaction and settlement accuracy</strong> downstream.</li>
+          <li>Enforced compliance standards by removing non-compliant records and collaborated cross-functionally to identify systemic issues and drive process improvements.</li>
+          <li>Built structured reporting and identified patterns in defect data to inform product-level fixes and reduce manual operations load.</li>
+          <li>Coordinated with Legal, Vendor Managers, and Account Managers to resolve partner escalations and ensure regulatory adherence.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="job">
+      <div class="when">Dec 2024 — Feb 2025<span class="co">Inbest</span><span class="loc">Kolkata · On-site</span></div>
+      <div>
+        <h3>Junior Operations Executive</h3>
+        <ul>
+          <li>Managed <strong>end-to-end insurance servicing</strong> (Health &amp; Life) — policy onboarding, renewals, claims resolution, and client documentation compliance.</li>
+          <li>Handled client escalations on policy discrepancies, coverage gaps, and documentation independently, following through to resolution.</li>
+          <li>Contributed to <strong>15% growth in new client acquisition</strong> through proactive outreach, awareness campaigns, and tailored product recommendations.</li>
+          <li>Maintained accurate client records and ensured regulatory compliance, building familiarity with financial-product operations workflows.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="job">
+      <div class="when">Sep 2024 — Dec 2024<span class="co">Concentrix</span><span class="loc">Kolkata · On-site</span></div>
+      <div>
+        <h3>Operations Executive</h3>
+        <ul>
+          <li>Delivered operations support for Life, General, and Health insurance clients — policy management, claims resolution, and coverage queries across inbound and outbound channels.</li>
+          <li>Directly contributed <strong>18% of the team's client retention</strong> through proactive issue identification, personalised recommendations, and consistent SLA compliance.</li>
+          <li>Resolved claims escalations by liaising with internal teams and providing structured, <strong>root-cause-focused</strong> responses that reduced repeat contacts.</li>
+          <li>Tracked and reconciled client data in Excel and Google Sheets for operational reporting — building hands-on <strong>reconciliation and ledger</strong> skills.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="skills">
+  <div class="wrap">
+    <div class="sec-head"><span class="no">05</span><h2>Skills</h2></div>
+    <div class="skillcols">
+      <div>
+        <h3>Product &amp; Operations</h3>
+        <div class="chips">
+          <span class="chip core">Product Operations</span>
+          <span class="chip core">KYC &amp; Onboarding Compliance</span>
+          <span class="chip core">Payments &amp; Settlement Ops</span>
+          <span class="chip core">SLA Tracking &amp; Management</span>
+          <span class="chip">Partner Management &amp; Escalations</span>
+          <span class="chip">Reconciliation &amp; Ledger Mgmt</span>
+          <span class="chip">L1 Escalation Handling</span>
+          <span class="chip">Cross-product Process Ownership</span>
+          <span class="chip">Root Cause Analysis</span>
+          <span class="chip">Process Automation</span>
+          <span class="chip">Cross-functional Coordination</span>
+        </div>
+      </div>
+      <div>
+        <h3>Technical &amp; Analytical</h3>
+        <div class="chips">
+          <span class="chip core">Excel / Google Sheets (Adv.)</span>
+          <span class="chip core">Dashboards &amp; Reporting</span>
+          <span class="chip">SQL</span>
+          <span class="chip">Data Analytics</span>
+          <span class="chip">Workflow Automation Tools</span>
+          <span class="chip">CRM Systems</span>
+          <span class="chip">Case &amp; Ticket Management</span>
+          <span class="chip">Prompt Engineering</span>
+          <span class="chip">Generative AI</span>
+          <span class="chip">Agentic AI</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="background">
+  <div class="wrap">
+    <div class="sec-head"><span class="no">06</span><h2>Education &amp; certifications</h2></div>
+    <div class="two">
+      <div class="card">
+        <h3>Education</h3>
+        <div class="edu-item"><div class="t">B.Com — Accounting &amp; Finance</div><div class="d">University of Calcutta · 2020–2023 · Grade A</div></div>
+        <div class="edu-item"><div class="t">Class XII — Business / Commerce</div><div class="d">Kendriya Vidyalaya · 2019–2020</div></div>
+      </div>
+      <div class="card">
+        <h3>Certifications</h3>
+        <div class="cert"><span>Prompt Engineering — AWS</span><span class="dt">Nov 2025</span></div>
+        <div class="cert"><span>Generative AI: Art of the Possible — AWS</span><span class="dt">Nov 2025</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<section class="fit">
+  <div class="wrap">
+    <h2>Ready to own client operations from intake to durable resolution.</h2>
+    <p class="lede">A commerce-and-finance foundation, two years running compliance and escalation workflows for global, multi-region programs, and hands-on reconciliation from insurance operations — a fit for client-operations, onboarding, and payment-operations roles across fintech, SaaS, insurance, logistics, and e-commerce.</p>
+    <div class="btnrow">
+      <a class="btn" href="mailto:arghab2001@gmail.com">Email arghab2001@gmail.com</a>
+      <a class="btn ghost" href="https://linkedin.com/in/argha-banik-8913b8268">Connect on LinkedIn</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap" style="display:flex; justify-content:space-between; width:100%; max-width:var(--maxw); gap:8px; flex-wrap:wrap;">
+    <span>Argha Banik · Client Operations Portfolio</span>
+    <span>Kolkata, IN · Open to cross-industry client-operations roles</span>
+  </div>
+</footer>
+
+</body>
+</html>
