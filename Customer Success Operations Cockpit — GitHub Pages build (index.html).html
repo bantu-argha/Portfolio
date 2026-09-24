@@ -1,0 +1,2001 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- __artifactory_data_bridge__ -->
+<script>(function dataBridgeImpl() {
+    // A read of a 20,000-row window chains dozens of server pages in the shell;
+    // give it room before declaring the shell absent.
+    const TIMEOUT_MS = 60000;
+    const pending = {};
+    const listeners = {};
+    let seq = 0;
+    function fail(code, message) {
+        const err = new Error(message);
+        err.code = code;
+        return err;
+    }
+    // Bare `parent`, matching the sibling bridges: works in the sandboxed
+    // iframe and in the vm-based test harness alike.
+    function post(msg) {
+        try {
+            parent.postMessage(msg, '*');
+        }
+        catch (_e) {
+            /* parent gone or blocked; nothing useful to do */
+        }
+    }
+    function call(type, payload) {
+        return new Promise(function (resolve, reject) {
+            seq += 1;
+            const requestId = 'afy-data-' + seq + '-' + Math.random().toString(36).slice(2, 10);
+            const timer = setTimeout(function () {
+                delete pending[requestId];
+                reject(fail('timeout', 'The viewer did not answer. Open this page inside Artifactory.'));
+            }, TIMEOUT_MS);
+            pending[requestId] = {
+                resolve: function (r) {
+                    clearTimeout(timer);
+                    delete pending[requestId];
+                    if (r.ok) {
+                        resolve(r);
+                        return;
+                    }
+                    const err = fail(r.code || 'internal', r.error || 'The data request failed.');
+                    // A conflict names the durable prefix and the rows as they are
+                    // now, so the page can say what happened instead of retrying.
+                    if (typeof r.applied === 'number')
+                        err.applied = r.applied;
+                    if (r.rows !== undefined)
+                        err.rows = r.rows;
+                    reject(err);
+                },
+                timer: timer,
+            };
+            const msg = { type: type, requestId: requestId };
+            for (const k in payload) {
+                if (payload[k] !== undefined)
+                    msg[k] = payload[k];
+            }
+            post(msg);
+        });
+    }
+    window.addEventListener('message', function (e) {
+        const d = e.data;
+        if (!d || typeof d !== 'object' || typeof d.type !== 'string')
+            return;
+        if ((d.type === 'artifactory-data-response' || d.type === 'artifactory-data-mutated') &&
+            typeof d.requestId === 'string') {
+            const p = pending[d.requestId];
+            if (p)
+                p.resolve(d);
+            return;
+        }
+        if (d.type === 'artifactory-data-changed' && typeof d.source === 'string') {
+            const subs = listeners[d.source];
+            if (!subs)
+                return;
+            for (let i = 0; i < subs.length; i++) {
+                try {
+                    subs[i](d);
+                }
+                catch (_err) {
+                    // One subscriber's fault must not starve the others.
+                }
+            }
+        }
+    });
+    const api = {
+        /** Read a window of rows. opts: { offset?: number, limit?: number }.
+         *
+         *  The reply's `caller` is the viewer's alias, resolved by the SERVER —
+         *  this is the ONLY way a page can learn who is looking at it. Use it to
+         *  mark a viewer's own rows; use `mutate({ identity })` to WRITE them. */
+        rows: function (source, opts) {
+            return call('artifactory-data-request', {
+                source: source,
+                offset: opts && opts.offset,
+                limit: opts && opts.limit,
+            }).then(function (r) {
+                const table = r;
+                /** Rows as records keyed by displayHeader (trimmed name or `col N`). */
+                table.objects = function () {
+                    const names = table.displayHeader || [];
+                    const out = [];
+                    const rows = table.rows || [];
+                    for (let i = 0; i < rows.length; i++) {
+                        const rec = {};
+                        for (let c = 0; c < names.length; c++)
+                            rec[names[c]] = rows[i][c] !== undefined ? rows[i][c] : '';
+                        out.push(rec);
+                    }
+                    return out;
+                };
+                return table;
+            });
+        },
+        /** Apply row operations against a key column. Durable when it resolves:
+         *  { applied, rows } with post-write records keyed by displayHeader.
+         *
+         *  Pass `identity: '<column>'` to have the SHELL record whoever is viewing
+         *  into that column. Do NOT put an alias in the row yourself — the value is
+         *  written server-side and any value you send for that column is dropped.
+         *  With `key` set to the same column you get one row per person, enforced by
+         *  the server:
+         *
+         *    mutate(src, { key: 'alias', identity: 'alias',
+         *                  ops: [{ op: 'upsert', row: { word: 'petrichor' } }] })
+         *
+         *  A page cannot learn its viewer any other way, and must never ask them to
+         *  type it. `rows(...)` reports the same identity as `caller`. */
+        mutate: function (source, req) {
+            return call('artifactory-data-mutate', {
+                source: source,
+                key: req && req.key,
+                identity: req && req.identity,
+                ops: req && req.ops,
+            });
+        },
+        /** Subscribe to live changes of a source. Returns the unsubscribe. */
+        onChange: function (source, listener) {
+            const subs = listeners[source] || (listeners[source] = []);
+            subs.push(listener);
+            return function () {
+                const i = subs.indexOf(listener);
+                if (i >= 0)
+                    subs.splice(i, 1);
+            };
+        },
+    };
+    const w = window;
+    w.artifactory = w.artifactory || {};
+    if (!w.artifactory.data)
+        w.artifactory.data = api;
+})();</script>
+<!-- __artifactory_state_bridge__ -->
+<script>(function stateBridgeImpl() {
+    const STATE_KEY = 'data-artifactory-state-key';
+    const BY_ATTR = 'data-artifactory-state-by';
+    const AT_ATTR = 'data-artifactory-state-at';
+    const SCOPE_ATTR = 'data-artifactory-state-scope';
+    const ANON_ATTR = 'data-artifactory-state-anon';
+    const TTL_ATTR = 'data-artifactory-state-ttl';
+    const POLL_ATTR = 'data-artifactory-state-poll';
+    const ROSTER_ATTR = 'data-artifactory-state-roster';
+    const SHOW_ATTR = 'data-artifactory-state-show';
+    let values = {};
+    let meta = {};
+    let aggregates = {};
+    let canWrite = false;
+    let canInteract = false;
+    let myAlias = null;
+    let announced = false;
+    const saveTimers = {};
+    // `dirty[key]` marks a text field with a LOCAL EDIT NOT YET SENT. It exists to
+    // stop a remote value from silently discarding what someone is part-way
+    // through writing. See the write-back listeners and the update handler below.
+    const dirty = {};
+    function post(msg) {
+        try {
+            parent.postMessage(msg, '*');
+        }
+        catch (_e) {
+            /* parent gone or blocked; nothing useful to do */
+        }
+    }
+    function keyedControls() {
+        return document.querySelectorAll('[' + STATE_KEY + ']');
+    }
+    function isPerUser(el) {
+        return (el.getAttribute(SCOPE_ATTR) || '').toLowerCase() === 'per-user';
+    }
+    function isAnon(el) {
+        return el.hasAttribute(ANON_ATTR);
+    }
+    /** Classify a tagged control so we know how to read/write/type it. */
+    function controlKind(el) {
+        const tag = el.tagName;
+        const type = (el.getAttribute('type') || '').toLowerCase();
+        if (tag === 'INPUT' && type === 'checkbox')
+            return 'bool';
+        if (tag === 'INPUT' && type === 'radio')
+            return 'radio';
+        if (tag === 'INPUT' && (type === 'number' || type === 'range'))
+            return 'number';
+        if (tag === 'SELECT')
+            return 'select';
+        if (tag === 'TEXTAREA')
+            return 'text';
+        if (tag === 'INPUT')
+            return 'text';
+        return 'other';
+    }
+    /**
+     * After the bridge sets a control's value programmatically (on hydrate or a
+     * remote update), fire input+change so AUTHOR JS hooked to those events runs
+     * — otherwise a value set via el.value/el.checked fires nothing, so e.g. a
+     * range slider's readout updates only on the window that dragged it, not on
+     * a viewer watching it move. Synthetic events carry isTrusted=false; the
+     * bridge's OWN write-listeners ignore those (see below), so this can't loop
+     * back into a write. `bubbles:true` so delegated author handlers catch it.
+     */
+    function fireSyntheticEvents(el) {
+        try {
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        catch (_e) {
+            /* an author handler threw; the value is already applied */
+        }
+    }
+    /*
+     * Assigning el.value collapses the selection to the end -- that IS the caret
+     * jump. A text control therefore keeps its selection ACROSS the assignment:
+     * the remote value still lands (the field is live, and a co-editor's text
+     * must appear) and the cursor stays where the person put it.
+     *
+     * Anchoring is DIFF-BASED, not offset-based. Two simpler schemes both fail:
+     *
+     *   absolute offset  breaks when the edit lands BEFORE the caret -- someone
+     *                    prepends a word and your cursor slides backwards
+     *                    through the text.
+     *   distance-from-end  breaks when the edit lands AFTER the caret, which is
+     *                    the common case (a co-editor typing at the end of the
+     *                    line). Measured: caret 10 hopped to 23 on an append,
+     *                    because "20 characters from the tail" moved with the
+     *                    tail. Reported as "the cursor is still hopping".
+     *
+     * So find where the text actually changed -- common prefix, common suffix --
+     * and shift the caret only if the change was upstream of it. An edit after
+     * the caret moves nothing; an edit before it moves it by exactly the length
+     * delta; an edit spanning it clamps into the rewritten span, which is the
+     * only case with no correct answer.
+     */
+    function mapCaret(oldValue, newValue, pos, prefixLen, suffixLen, delta) {
+        if (pos <= prefixLen)
+            return pos;
+        if (pos >= oldValue.length - suffixLen)
+            return pos + delta;
+        const lo = prefixLen;
+        const hi = newValue.length - suffixLen;
+        const out = pos + delta;
+        return out < lo ? lo : out > hi ? hi : out;
+    }
+    function setValueKeepingCaret(el, newValue) {
+        const oldValue = el.value;
+        if (oldValue === newValue)
+            return;
+        const selStart = el.selectionStart;
+        const selEnd = el.selectionEnd;
+        // Common prefix, then common suffix measured from the ends without letting
+        // the two regions overlap.
+        let prefixLen = 0;
+        const maxPrefix = Math.min(oldValue.length, newValue.length);
+        while (prefixLen < maxPrefix && oldValue.charCodeAt(prefixLen) === newValue.charCodeAt(prefixLen)) {
+            prefixLen++;
+        }
+        let suffixLen = 0;
+        const maxSuffix = Math.min(oldValue.length - prefixLen, newValue.length - prefixLen);
+        while (suffixLen < maxSuffix &&
+            oldValue.charCodeAt(oldValue.length - 1 - suffixLen) === newValue.charCodeAt(newValue.length - 1 - suffixLen)) {
+            suffixLen++;
+        }
+        // Do not cut a surrogate pair in half: a boundary inside an emoji would put
+        // the caret between the halves of one character.
+        const boundaryCode = newValue.charCodeAt(prefixLen);
+        if (prefixLen > 0 && boundaryCode >= 0xdc00 && boundaryCode <= 0xdfff)
+            prefixLen--;
+        const delta = newValue.length - oldValue.length;
+        el.value = newValue;
+        try {
+            el.setSelectionRange(mapCaret(oldValue, newValue, selStart, prefixLen, suffixLen, delta), mapCaret(oldValue, newValue, selEnd, prefixLen, suffixLen, delta));
+        }
+        catch (_e) {
+            /* selection not supported on this control; the value is already applied */
+        }
+    }
+    function applyTo(el, val) {
+        const kind = controlKind(el);
+        const control = el;
+        if (kind === 'bool') {
+            control.checked = val === 'true';
+            fireSyntheticEvents(el);
+        }
+        else if (kind === 'radio') {
+            control.checked = control.value === val;
+            fireSyntheticEvents(el);
+        }
+        else if (kind === 'select' || kind === 'text' || kind === 'number') {
+            const newValue = val == null ? '' : val;
+            // Only a focused TEXT control has a caret worth carrying. setSelectionRange
+            // throws on number/email inputs in some engines, so gate on kind, not just
+            // try/catch.
+            if (kind === 'text' && el === document.activeElement)
+                setValueKeepingCaret(control, newValue);
+            else
+                control.value = newValue;
+            fireSyntheticEvents(el);
+        }
+        else {
+            el.setAttribute('data-artifactory-state-value', val == null ? '' : val);
+        }
+    }
+    function readFrom(el) {
+        const kind = controlKind(el);
+        const control = el;
+        if (kind === 'bool')
+            return { valueType: 'BOOL', value: control.checked ? 'true' : 'false' };
+        if (kind === 'number')
+            return { valueType: 'NUMBER', value: control.value != null ? String(control.value) : '' };
+        return { valueType: 'STRING', value: control.value != null ? String(control.value) : '' };
+    }
+    /** A per-user control is writable when canInteract; a shared one when canWrite. */
+    function writable(el) {
+        return isPerUser(el) ? canInteract : canWrite;
+    }
+    /*
+     * Viewers get `disabled` (read-only). We do NOT add aria-readonly: it is
+     * spec-defined only for textbox/combobox/grid/listbox/slider roles, not for
+     * checkbox/radio/native select, where linters flag it and screen readers may
+     * mis-announce it. `disabled` alone conveys the non-interactive state.
+     * U6: only the bridge's own read-only disabling is reversible. A control the
+     * author intentionally shipped `disabled` (e.g. a not-yet-open option) must
+     * stay disabled — so we mark the ones WE disable (data-afy-disabled) and only
+     * ever remove `disabled` from those, never from author-disabled controls.
+     */
+    function setDisabled() {
+        const controls = keyedControls();
+        for (let i = 0; i < controls.length; i++) {
+            const el = controls[i];
+            if (!writable(el)) {
+                if (!el.hasAttribute('disabled')) {
+                    el.setAttribute('disabled', '');
+                    el.setAttribute('data-afy-disabled', '');
+                }
+            }
+            else if (el.hasAttribute('data-afy-disabled')) {
+                el.removeAttribute('disabled');
+                el.removeAttribute('data-afy-disabled');
+            }
+        }
+    }
+    /*
+     * A stamp shows WHO/WHEN, but only while the cell is "set" — otherwise an
+     * unchecked sign-off would still read "by <alias>" because that alias is
+     * still the last writer (it just wrote "false"). For a BOOL the cell is set
+     * iff value==="true"; for anything else iff the value is non-empty. When not
+     * set we blank the span so the author CSS (:has(.by:empty)) hides the row.
+     */
+    function isSet(key) {
+        const el = document.querySelector('[' + STATE_KEY + '="' + (window.CSS && CSS.escape ? CSS.escape(key) : key) + '"]');
+        const v = values[key];
+        if (el && controlKind(el) === 'bool')
+            return v === 'true';
+        return v != null && v !== '';
+    }
+    /*
+     * The -by/-at attributes name a DISPLAY span ("by <alias>") whose attribute
+     * VALUE is the state-key to show. Two guards keep a misuse from destroying a
+     * control: (1) a bare/empty attribute (key="") is skipped — it addresses no
+     * cell; (2) we NEVER write textContent onto an element that is itself a state
+     * control (hasAttribute STATE_KEY). Without guard (2), a select/textarea that
+     * also carries a bare -by would have its children (its options / text) wiped
+     * by textContent="", leaving an empty, unpickable control that can never write
+     * state. (An input has no children so it was silently unharmed, which is why
+     * only selects/textareas broke.)
+     */
+    function attribution() {
+        const byEls = document.querySelectorAll('[' + BY_ATTR + ']');
+        for (let i = 0; i < byEls.length; i++) {
+            const byEl = byEls[i];
+            if (byEl.hasAttribute(STATE_KEY))
+                continue;
+            const key = byEl.getAttribute(BY_ATTR);
+            if (!key)
+                continue;
+            const m = meta[key];
+            byEl.textContent = isSet(key) && m && m.by ? m.by : '';
+        }
+        const atEls = document.querySelectorAll('[' + AT_ATTR + ']');
+        for (let j = 0; j < atEls.length; j++) {
+            const atEl = atEls[j];
+            if (atEl.hasAttribute(STATE_KEY))
+                continue;
+            const key = atEl.getAttribute(AT_ATTR);
+            if (!key)
+                continue;
+            const m = meta[key];
+            const iso = isSet(key) && m && m.at ? m.at : '';
+            atEl.textContent = iso ? iso.slice(0, 10) : '';
+            if (iso) {
+                atEl.setAttribute('title', iso);
+                if (atEl.tagName === 'TIME')
+                    atEl.setAttribute('datetime', iso);
+            }
+            else {
+                atEl.removeAttribute('title');
+                if (atEl.tagName === 'TIME')
+                    atEl.removeAttribute('datetime');
+            }
+        }
+    }
+    function escapeHtml(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+    /** Render each poll element from its aggregate: a row per option with a bar. */
+    function renderPolls() {
+        const pollEls = document.querySelectorAll('[' + POLL_ATTR + ']');
+        for (let i = 0; i < pollEls.length; i++) {
+            const el = pollEls[i];
+            const agg = aggregates[el.getAttribute(POLL_ATTR)];
+            if (!agg) {
+                el.textContent = '';
+                continue;
+            }
+            const dist = agg.distribution || {};
+            const total = +agg.totalCount || 0;
+            let html = '';
+            for (const option in dist) {
+                if (!Object.prototype.hasOwnProperty.call(dist, option))
+                    continue;
+                // Coerce counts to numbers before they touch innerHTML (defense-in-depth:
+                // the server types them as Integer, but never trust an upstream count).
+                const count = +dist[option] || 0;
+                const pct = total > 0 ? Math.round((count * 100) / total) : 0;
+                html +=
+                    '<div class="afy-poll-row" style="display:flex;align-items:center;gap:8px;margin:4px 0">' +
+                        '<span class="afy-poll-label" style="min-width:8ch">' +
+                        escapeHtml(option) +
+                        '</span>' +
+                        '<span class="afy-poll-bar" style="flex:1;height:10px;background:rgba(0,0,0,0.08);border-radius:5px;overflow:hidden">' +
+                        '<span style="display:block;height:100%;width:' +
+                        pct +
+                        '%;background:currentColor;opacity:0.55"></span></span>' +
+                        '<span class="afy-poll-count">' +
+                        count +
+                        ' (' +
+                        pct +
+                        '%)</span></div>';
+            }
+            html +=
+                '<div class="afy-poll-total" style="opacity:0.7;font-size:0.85em;margin-top:4px">' + total + ' total</div>';
+            el.innerHTML = html;
+        }
+    }
+    /*
+     * Render each roster element from its aggregate's per-writer entries: one row
+     * per writer (alias + their value). Only attributable aggregates carry
+     * `entries` — for an anonymous key the server omits them, so a roster on an
+     * anon key shows the count only (it can never reveal a name even if asked).
+     */
+    function renderRosters() {
+        const rosterEls = document.querySelectorAll('[' + ROSTER_ATTR + ']');
+        for (let i = 0; i < rosterEls.length; i++) {
+            const el = rosterEls[i];
+            const agg = aggregates[el.getAttribute(ROSTER_ATTR)];
+            if (!agg) {
+                el.textContent = '';
+                continue;
+            }
+            const entries = agg.entries;
+            let html = '';
+            if (entries && entries.length) {
+                for (let j = 0; j < entries.length; j++) {
+                    const entry = entries[j];
+                    html +=
+                        '<div class="afy-roster-row" style="display:flex;gap:8px;margin:3px 0">' +
+                            '<span class="afy-roster-alias">' +
+                            escapeHtml(entry.alias) +
+                            '</span>' +
+                            // For a BOOL read-receipt the value is always "true" — show just the
+                            // alias; for anything else (an RSVP) show the chosen value too.
+                            (entry.value !== 'true'
+                                ? '<span class="afy-roster-value" style="opacity:0.7">' + escapeHtml(entry.value) + '</span>'
+                                : '') +
+                            '</div>';
+                }
+            }
+            else {
+                html =
+                    '<div class="afy-roster-count">' +
+                        (+agg.totalCount || 0) +
+                        (agg.anonymous ? ' (anonymous)' : '') +
+                        '</div>';
+            }
+            el.innerHTML = html;
+        }
+    }
+    /*
+     * Mirror a key's current value into every -show display. The value lives in
+     * `values` (the shared source of truth), so a control writing the key and a
+     * readout/bar showing it cannot drift. Same guards as attribution(): skip an
+     * element that is itself a state control, skip a bare/empty key. We set the
+     * numeric part as the `--afy-state` CSS var + `data-afy-state-value` attr (so a
+     * bar binds with width:calc(var(--afy-state)*1%) — no JS); and set textContent
+     * ONLY when the element has no element children, so a bar wrapping an inner
+     * fill <span> keeps its children (never re-introduce the textContent-wipe bug).
+     */
+    function renderShows() {
+        const showEls = document.querySelectorAll('[' + SHOW_ATTR + ']');
+        for (let i = 0; i < showEls.length; i++) {
+            const showEl = showEls[i];
+            if (showEl.hasAttribute(STATE_KEY))
+                continue;
+            const key = showEl.getAttribute(SHOW_ATTR);
+            if (!key)
+                continue;
+            const v = Object.prototype.hasOwnProperty.call(values, key) ? values[key] : null;
+            const sv = v == null ? '' : String(v);
+            showEl.setAttribute('data-afy-state-value', sv);
+            const num = parseFloat(sv);
+            showEl.style.setProperty('--afy-state', isNaN(num) ? '0' : String(num));
+            if (!showEl.firstElementChild)
+                showEl.textContent = sv;
+        }
+    }
+    /*
+     * ONE guard, shared by both inbound paths. It used to live only on the
+     * `-update` branch, and `hydrate()` applied values unconditionally -- which
+     * was the whole bug: the HOST re-posts `artifactory-state-init` whenever the
+     * entry list changes (ArtifactViewer re-inits after the refetch that follows
+     * any write), so a co-editor's edit arrived through the UNGUARDED door. A
+     * user typing mid-sentence had the field overwritten and the caret thrown to
+     * the end. Reproduced against a DOM stub: caret 10 -> 27, text replaced,
+     * field still focused. Duplicating the condition is how the two paths
+     * drifted apart, so there is now exactly one.
+     *
+     * What must be REFUSED, as opposed to what must merely not move the caret.
+     *
+     * Focus alone is NOT a reason to refuse. Refusing on focus was a bad fix for
+     * the caret jump: it stopped the field updating at all, so a viewer with the
+     * cursor parked in a field silently stopped seeing co-editors -- trading a
+     * cosmetic bug for a correctness one. The caret is now preserved inside
+     * applyTo, so a focused field can accept remote text safely.
+     *
+     * Only genuinely UNSAVED local text is refused: overwriting it would destroy
+     * work the person can still see on screen.
+     */
+    function keepLocal(el, key, incoming) {
+        if (controlKind(el) !== 'text')
+            return false;
+        // A local edit typed but not yet sent (600ms debounce). Losing this eats a
+        // half-typed sentence.
+        if (dirty[key])
+            return true;
+        // A no-op write still fires a synthetic input/change pair into author JS and
+        // can disturb the selection for nothing.
+        return el.value === (incoming == null ? '' : incoming);
+    }
+    function hydrate() {
+        const controls = keyedControls();
+        for (let i = 0; i < controls.length; i++) {
+            const el = controls[i];
+            const key = el.getAttribute(STATE_KEY);
+            // Per-user controls hydrate from the aggregate's myValue (the caller's own
+            // choice); shared controls from the shared value map.
+            if (isPerUser(el)) {
+                const agg = aggregates[key];
+                if (agg && agg.myValue != null && !keepLocal(el, key, agg.myValue))
+                    applyTo(el, agg.myValue);
+            }
+            else if (Object.prototype.hasOwnProperty.call(values, key) && !keepLocal(el, key, values[key])) {
+                applyTo(el, values[key]);
+            }
+        }
+        // setDisabled/attribution/polls/rosters/shows are always safe: they touch
+        // chrome and read-only displays, never the value of a control being edited.
+        setDisabled();
+        attribution();
+        renderPolls();
+        renderRosters();
+        renderShows();
+    }
+    function send(el) {
+        const key = el.getAttribute(STATE_KEY);
+        if (!key)
+            return;
+        const read = readFrom(el);
+        const msg = { type: 'artifactory-state-change', stateKey: key, valueType: read.valueType, value: read.value };
+        if (isPerUser(el)) {
+            msg.scope = 'PER_USER';
+            msg.anon = isAnon(el);
+            const ttl = parseInt(el.getAttribute(TTL_ATTR) || '', 10);
+            if (!isNaN(ttl) && ttl > 0)
+                msg.ttlSeconds = ttl;
+        }
+        values[key] = read.value;
+        // Optimistic local attribution: the current user is now the last writer, so
+        // the stamp reflects the edit immediately (a check shows the name now, not
+        // only after the server echo) and an uncheck clears it (isSet() is false).
+        // A3: never stamp the alias for an anonymous widget — the server strips it,
+        // but the local optimistic path would otherwise paint the voter's own alias
+        // on an anonymous poll (a privacy-intent break, even if local-only).
+        if (myAlias && !isAnon(el))
+            meta[key] = { by: myAlias, at: new Date().toISOString() };
+        attribution();
+        renderShows();
+        post(msg);
+    }
+    /*
+     * Write-back listeners react ONLY to genuine user edits (e.isTrusted). The
+     * synthetic input/change events that applyTo()/fireSyntheticEvents() dispatch
+     * carry isTrusted=false, so they drive author readouts without looping back
+     * into a write (which would re-send every hydrated value to the server).
+     */
+    document.addEventListener('change', (e) => {
+        if (!e.isTrusted)
+            return;
+        const el = e.target;
+        if (!el || !el.getAttribute || !el.getAttribute(STATE_KEY))
+            return;
+        if (!writable(el) || controlKind(el) === 'text')
+            return;
+        send(el);
+    }, true);
+    /*
+     * A text edit is DIRTY from the first keystroke until its debounced save
+     * actually fires. During that window a remote value must not overwrite the
+     * field: the 600ms gap is exactly long enough for a co-editor's update to
+     * arrive and wipe a half-typed sentence, and the `activeElement` guard below
+     * does not cover it (the author may have tabbed away with the save pending).
+     */
+    document.addEventListener('input', (e) => {
+        if (!e.isTrusted)
+            return;
+        const el = e.target;
+        if (!el || !el.getAttribute || !el.getAttribute(STATE_KEY))
+            return;
+        if (!writable(el) || controlKind(el) !== 'text')
+            return;
+        const key = el.getAttribute(STATE_KEY);
+        dirty[key] = true;
+        clearTimeout(saveTimers[key]);
+        saveTimers[key] = setTimeout(() => {
+            delete dirty[key];
+            send(el);
+        }, 600);
+    }, true);
+    window.addEventListener('message', (e) => {
+        const d = e.data;
+        if (!d)
+            return;
+        if (d.type === 'artifactory-state-init') {
+            canWrite = !!d.canWrite;
+            canInteract = !!d.canInteract;
+            myAlias = d.myAlias || null;
+            values = {};
+            meta = {};
+            aggregates = {};
+            const entries = d.entries || [];
+            for (let i = 0; i < entries.length; i++) {
+                const entry = entries[i];
+                if (entry && entry.stateKey != null) {
+                    values[entry.stateKey] = entry.value;
+                    meta[entry.stateKey] = { by: entry.updatedBy, at: entry.updatedAt };
+                }
+            }
+            const aggs = d.aggregates || [];
+            for (let j = 0; j < aggs.length; j++) {
+                const agg = aggs[j];
+                if (agg && agg.stateKey != null) {
+                    aggregates[agg.stateKey] = agg;
+                    // U7: hydrate the per-user -by/-at stamp on load. For an attributable
+                    // key the aggregate carries per-writer `entries`; surface THIS viewer's
+                    // own row (by myAlias) as the stamp + value, so an attributable
+                    // per-user widget shows "you, <date>" before this viewer writes again.
+                    // Anonymous keys carry no entries, so nothing is stamped (privacy
+                    // preserved).
+                    if (myAlias && agg.entries && agg.entries.length) {
+                        for (let k = 0; k < agg.entries.length; k++) {
+                            const entry = agg.entries[k];
+                            if (entry && entry.alias === myAlias) {
+                                values[agg.stateKey] = entry.value;
+                                meta[agg.stateKey] = { by: entry.alias, at: entry.updatedAt };
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            hydrate();
+        }
+        else if (d.type === 'artifactory-state-update') {
+            if (d.stateKey != null) {
+                values[d.stateKey] = d.value;
+                // Never bind an alias to a key the server holds as an anonymous
+                // aggregate — even if an echo carries updatedBy, an anonymous poll must
+                // not paint a name.
+                const agg = aggregates[d.stateKey];
+                if ((d.updatedBy != null || d.updatedAt != null) && !(agg && agg.anonymous)) {
+                    meta[d.stateKey] = { by: d.updatedBy, at: d.updatedAt };
+                }
+                /*
+                 * Do not stomp a field the user is actively typing in: re-applying
+                 * el.value on the focused element jumps the caret and can overwrite
+                 * in-flight keystrokes.
+                 *
+                 * keepLocal's three guards each cover a case the others miss:
+                 *   activeElement  the field has focus right now (caret preserved
+                 *                  inside applyTo rather than refused here).
+                 *   dirty[key]     a local edit is typed but not yet sent. The
+                 *                  `activeElement` check alone leaves a 600ms hole:
+                 *                  type, tab away, and a co-editor's value overwrites
+                 *                  the pending text. Verified by driving two iframes
+                 *                  against this exact script -- an unsaved 20-character
+                 *                  sentence survived only because it happened to win
+                 *                  the race, which is not a guarantee.
+                 *   same value     applyTo() assigns el.value unconditionally, and
+                 *                  assigning even an IDENTICAL string to a text control
+                 *                  is not always free: engines may collapse the
+                 *                  selection, and it fires a synthetic input/change
+                 *                  pair into author JS for no reason. Skipping a no-op
+                 *                  write is strictly better.
+                 */
+                const controls = keyedControls();
+                for (let k = 0; k < controls.length; k++) {
+                    const target = controls[k];
+                    if (target.getAttribute(STATE_KEY) !== d.stateKey || isPerUser(target))
+                        continue;
+                    if (keepLocal(target, d.stateKey, d.value))
+                        continue;
+                    applyTo(target, d.value);
+                }
+                attribution();
+                renderShows();
+            }
+        }
+    });
+    /*
+     * Announce readiness exactly once (on DOMContentLoaded, or immediately if the
+     * document already finished parsing). The bridge hydrates the widgets present
+     * at that point; it does not observe later DOM mutations.
+     */
+    function announce() {
+        if (announced)
+            return;
+        announced = true;
+        post({ type: 'artifactory-state-ready' });
+    }
+    if (document.readyState === 'loading')
+        document.addEventListener('DOMContentLoaded', announce);
+    else
+        announce();
+})();</script>
+<!-- __artifactory_comment_bridge__ -->
+<script>(function commentBridgeImpl() {
+    /** Prefix/suffix context captured around a selection, in characters. */
+    const CONTEXT_CHARS = 48;
+    const OVERLAY_ID = '__artifactory_comment_overlay';
+    let anchors = [];
+    let activeId = null;
+    let commentMode = false;
+    /** commentId -> the live Range its anchor resolved to (rebuilt by locateAll). */
+    let ranges = {};
+    let resizeTimer;
+    function root() {
+        return document.body || document.documentElement;
+    }
+    /** True when a text node sits inside markup that never renders as text. */
+    function inNonRenderedContainer(node) {
+        let p = node.parentNode;
+        while (p) {
+            const tag = p.nodeName;
+            if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT')
+                return true;
+            p = p.parentNode;
+        }
+        return false;
+    }
+    /** Flatten every rendered text node into one string, keeping offsets. */
+    function buildTextMap() {
+        const walker = document.createTreeWalker(root(), NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                return inNonRenderedContainer(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+            },
+        });
+        const nodes = [];
+        let text = '';
+        let n;
+        while ((n = walker.nextNode())) {
+            const t = n;
+            nodes.push({ node: t, start: text.length });
+            text += t.data;
+        }
+        return { text, nodes };
+    }
+    /**
+     * DOM point -> offset in the flattened text (-1 when the point is unusable).
+     *
+     * Must be resolved through the same map the quote is sliced from. Measuring
+     * with `range.toString().length` instead counts SCRIPT/STYLE/NOSCRIPT text
+     * that buildTextMap rejects, so every offset below an in-body <style> or
+     * <script> block drifts forward by the length of that hidden text — the
+     * quote comes back the right length and the wrong text, and `occurrence`
+     * counts matches against a position that does not exist in the map.
+     */
+    function pointToOffset(map, node, offset) {
+        // Numeric literal, not Node.TEXT_NODE: this script is serialized and run in
+        // contexts (the unit harness's stub DOM) that define no global `Node`.
+        if (node.nodeType === 3) {
+            // The map already knows where this text node starts.
+            for (let i = 0; i < map.nodes.length; i++) {
+                if (map.nodes[i].node === node)
+                    return map.nodes[i].start + offset;
+            }
+            return -1; // point sits inside skipped (non-rendered) text
+        }
+        // Element point: `offset` is a child index. Snap to the first *mapped* text
+        // node at or after it, in tree order.
+        const order = textNodesInOrder(root(), []);
+        let i = countTextNodesBefore(node, offset);
+        for (; i < order.length; i++) {
+            for (let j = 0; j < map.nodes.length; j++) {
+                // Skipped nodes are absent from the map, so a point sitting just before
+                // a <style> block lands on the first rendered text after it.
+                if (map.nodes[j].node === order[i])
+                    return map.nodes[j].start;
+            }
+        }
+        // map.text is gapless, so the last mapped node's end is the document's end.
+        return map.text.length;
+    }
+    /** Every text node under `n` in document order, skip filter NOT applied. */
+    function textNodesInOrder(n, out) {
+        if (n.nodeType === 3) {
+            out.push(n);
+            return out;
+        }
+        const kids = n.childNodes;
+        for (let i = 0; i < kids.length; i++)
+            textNodesInOrder(kids[i], out);
+        return out;
+    }
+    /**
+     * How many text nodes (unfiltered) start strictly before the element point
+     * (`node`, `offset`) — i.e. that point's index into textNodesInOrder(root()).
+     */
+    function countTextNodesBefore(node, offset) {
+        let count = 0;
+        let done = false;
+        function visit(n) {
+            if (done)
+                return;
+            if (n === node) {
+                // Reached the point's own element: only its first `offset` children
+                // precede the point.
+                const kids = n.childNodes;
+                for (let i = 0; i < offset && i < kids.length; i++) {
+                    visit(kids[i]);
+                    if (done)
+                        return;
+                }
+                done = true;
+                return;
+            }
+            if (n.nodeType === 3) {
+                count++;
+                return;
+            }
+            const kids = n.childNodes;
+            for (let i = 0; i < kids.length; i++) {
+                visit(kids[i]);
+                if (done)
+                    return;
+            }
+        }
+        visit(root());
+        return count;
+    }
+    /**
+     * Offset in the flattened text -> DOM point. A range START at an exact node
+     * boundary must bias forward (start of the next node) — else an anchor
+     * beginning at char 0 of a block resolves to the tail of the previous text
+     * node (often an inter-block newline parented by the body), and
+     * scroll-to-comment scrolls the page top instead.
+     */
+    function offsetToPoint(map, offset, biasForward) {
+        for (let i = 0; i < map.nodes.length; i++) {
+            const entry = map.nodes[i];
+            const end = entry.start + entry.node.data.length;
+            if (offset < end || (offset === end && !biasForward)) {
+                return { node: entry.node, offset: Math.max(0, offset - entry.start) };
+            }
+        }
+        const last = map.nodes[map.nodes.length - 1];
+        return last ? { node: last.node, offset: last.node.data.length } : null;
+    }
+    function rangeFor(map, start, end) {
+        const a = offsetToPoint(map, start, true);
+        const b = offsetToPoint(map, end, false);
+        if (!a || !b)
+            return null;
+        const r = document.createRange();
+        try {
+            r.setStart(a.node, a.offset);
+            r.setEnd(b.node, b.offset);
+        }
+        catch (_e) {
+            return null;
+        }
+        return r;
+    }
+    function post(msg) {
+        try {
+            parent.postMessage(msg, '*');
+        }
+        catch (_e) {
+            /* parent gone or blocked; nothing useful to do */
+        }
+    }
+    /** Length of the common suffix of `a` and `b` (compared from the ends). */
+    function commonSuffixLen(a, b) {
+        let i = 0;
+        while (i < a.length && i < b.length && a[a.length - 1 - i] === b[b.length - 1 - i])
+            i++;
+        return i;
+    }
+    /** Length of the common prefix of `a` and `b`. */
+    function commonPrefixLen(a, b) {
+        let i = 0;
+        while (i < a.length && i < b.length && a[i] === b[i])
+            i++;
+        return i;
+    }
+    /**
+     * Whitespace-tolerant: each run of whitespace in the quote matches any run
+     * of whitespace in the text, so source line-wrapping/indentation between
+     * words (which lands in the rendered text node as newline + spaces) doesn't
+     * defeat an otherwise-exact match.
+     */
+    function quoteRegex(quote) {
+        const escaped = quote.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+        return new RegExp(escaped, 'g');
+    }
+    function candidatesFor(text, anchor) {
+        const re = quoteRegex(anchor.quote);
+        const out = [];
+        let m;
+        while ((m = re.exec(text)) !== null) {
+            const idx = m.index;
+            const len = m[0].length;
+            const before = text.slice(Math.max(0, idx - CONTEXT_CHARS), idx);
+            const after = text.slice(idx + len, idx + len + CONTEXT_CHARS);
+            out.push({
+                i: idx,
+                l: len,
+                ctx: commonSuffixLen(anchor.prefix || '', before) + commonPrefixLen(anchor.suffix || '', after),
+                ord: out.length,
+            });
+            if (len === 0)
+                re.lastIndex++;
+        }
+        return out;
+    }
+    /**
+     * Find where an anchor's quote sits in the flattened text.
+     *
+     *  - anchor WITHOUT `occurrence` (the legacy contract): fast path when the
+     *    recorded offsets still hold; else the highest score of (context overlap
+     *    − offset distance/100), a tie keeping the earliest match. This branch
+     *    must stay byte-for-byte equivalent to the shipped behavior — old
+     *    anchors may never resolve differently than they did.
+     *  - anchor WITH `occurrence` (the going-forward contract): ALWAYS the full
+     *    scan, resolved lexicographically — best context overlap, then nearest
+     *    ordinal to `occurrence`, then nearest offset to `startOffset`, then
+     *    earliest. A total, deterministic order even when one phrase repeats a
+     *    hundred times. The exact-offset fast path is deliberately not trusted
+     *    here: in repeated text a stale offset can land exactly on the WRONG
+     *    copy and the slice still matches the quote.
+     *
+     * Returns the match index and MATCHED length (which may differ from
+     * quote.length), or null when orphaned.
+     */
+    function locateQuote(text, anchor) {
+        if (typeof anchor.occurrence !== 'number' && text.slice(anchor.startOffset, anchor.endOffset) === anchor.quote) {
+            return { i: anchor.startOffset, l: anchor.quote.length };
+        }
+        const candidates = candidatesFor(text, anchor);
+        if (candidates.length === 0)
+            return null;
+        if (typeof anchor.occurrence === 'number') {
+            const occurrence = anchor.occurrence;
+            let best = candidates[0];
+            for (let i = 1; i < candidates.length; i++) {
+                const c = candidates[i];
+                if (c.ctx !== best.ctx) {
+                    if (c.ctx > best.ctx)
+                        best = c;
+                    continue;
+                }
+                const cOrd = Math.abs(c.ord - occurrence);
+                const bOrd = Math.abs(best.ord - occurrence);
+                if (cOrd !== bOrd) {
+                    if (cOrd < bOrd)
+                        best = c;
+                    continue;
+                }
+                if (Math.abs(c.i - anchor.startOffset) < Math.abs(best.i - anchor.startOffset))
+                    best = c;
+            }
+            return { i: best.i, l: best.l };
+        }
+        let best = null;
+        let bestScore = -1e9;
+        for (let i = 0; i < candidates.length; i++) {
+            const c = candidates[i];
+            const score = c.ctx - Math.abs(c.i - anchor.startOffset) / 100;
+            if (score > bestScore) {
+                bestScore = score;
+                best = c;
+            }
+        }
+        return best ? { i: best.i, l: best.l } : null;
+    }
+    /** Re-resolve every anchor against the current DOM into `ranges`. */
+    function locateAllAnchors() {
+        ranges = {};
+        const map = buildTextMap();
+        for (let i = 0; i < anchors.length; i++) {
+            const a = anchors[i];
+            if (!a.anchor)
+                continue;
+            const found = locateQuote(map.text, a.anchor);
+            if (!found)
+                continue;
+            const r = rangeFor(map, found.i, found.i + found.l);
+            if (r)
+                ranges[a.commentId] = r;
+        }
+    }
+    /**
+     * Overlay-rectangle highlighter: absolutely-positioned, click-through divs in
+     * document coordinates (rect + scroll offset) so they stay glued to the text
+     * as the page scrolls — no CSS Custom Highlight API needed, works on any
+     * browser, and never mutates the artifact content itself.
+     */
+    function overlayEl() {
+        let overlay = document.getElementById(OVERLAY_ID);
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.id = OVERLAY_ID;
+            overlay.style.cssText = 'position:absolute;top:0;left:0;width:0;height:0;pointer-events:none;z-index:2147483646;';
+            (document.body || document.documentElement).appendChild(overlay);
+        }
+        return overlay;
+    }
+    function drawHighlights() {
+        const overlay = overlayEl();
+        overlay.textContent = '';
+        if (!commentMode)
+            return;
+        const scrollX = window.pageXOffset || 0;
+        const scrollY = window.pageYOffset || 0;
+        for (const id in ranges) {
+            const rects = ranges[id].getClientRects();
+            const color = id === activeId ? 'rgba(255,153,0,0.40)' : 'rgba(0,176,255,0.22)';
+            for (let j = 0; j < rects.length; j++) {
+                const rc = rects[j];
+                if (rc.width <= 0 || rc.height <= 0)
+                    continue;
+                const d = document.createElement('div');
+                d.style.cssText =
+                    'position:absolute;border-radius:2px;left:' +
+                        (rc.left + scrollX) +
+                        'px;top:' +
+                        (rc.top + scrollY) +
+                        'px;width:' +
+                        rc.width +
+                        'px;height:' +
+                        rc.height +
+                        'px;background:' +
+                        color +
+                        ';';
+                overlay.appendChild(d);
+            }
+        }
+    }
+    window.addEventListener('resize', () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(drawHighlights, 150);
+    });
+    /** Tell the parent which anchors resolved and which are orphaned. */
+    function postLocated() {
+        if (!commentMode)
+            return;
+        const located = [];
+        const orphaned = [];
+        for (let i = 0; i < anchors.length; i++) {
+            const a = anchors[i];
+            if (!a.anchor)
+                continue;
+            (ranges[a.commentId] ? located : orphaned).push(a.commentId);
+        }
+        post({ type: 'artifactory-comment-located', located, orphaned });
+    }
+    function rerender() {
+        locateAllAnchors();
+        drawHighlights();
+        postLocated();
+    }
+    // Self-heal: re-locate when the DOM changes (lazy/late content). Debounced,
+    // and only while in comment mode; characterData+childList only (canvas/WebGL
+    // attribute churn does not fire this), so a heavy page does not thrash.
+    let observer = null;
+    let observerTimer;
+    function startObserving() {
+        if (observer || !window.MutationObserver)
+            return;
+        observer = new MutationObserver(() => {
+            if (!commentMode)
+                return;
+            clearTimeout(observerTimer);
+            observerTimer = setTimeout(rerender, 300);
+        });
+        try {
+            observer.observe(root(), { childList: true, subtree: true, characterData: true });
+        }
+        catch (_e) {
+            /* detached root; the next mode toggle retries */
+        }
+    }
+    function stopObserving() {
+        if (observer) {
+            try {
+                observer.disconnect();
+            }
+            catch (_e) {
+                /* already dead */
+            }
+            observer = null;
+        }
+    }
+    // Only capture selections-as-anchors while in comment mode (drawer open).
+    // When the drawer is closed a selection must yield no comment behaviour.
+    // A cleared/unusable selection posts anchor:null so the parent can dismiss
+    // its floating "Comment" pill (and clear a pending composer anchor) when
+    // the user clicks elsewhere INSIDE the iframe — those clicks never reach
+    // the parent document's own dismiss listeners.
+    //
+    // skipNoSelection breaks a race on highlight clicks: mouseup schedules the
+    // deferred onSelection, THEN the click handler below posts comment-click and
+    // sets the flag, THEN onSelection runs — the selection is collapsed (it was
+    // a click, not a drag), and without the flag it would post anchor:null right
+    // after comment-click, clobbering parent state the click just activated
+    // (e.g. a pending composer anchor). The flag is consumed unconditionally
+    // at the top of onSelection so it can never leak into a later interaction.
+    function postNoSelection() {
+        post({ type: 'artifactory-comment-selection', anchor: null });
+    }
+    let skipNoSelection = false;
+    function onSelection() {
+        const skip = skipNoSelection;
+        skipNoSelection = false;
+        if (!commentMode)
+            return;
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+            if (!skip)
+                postNoSelection();
+            return;
+        }
+        const range = sel.getRangeAt(0);
+        if (!root().contains(range.commonAncestorContainer))
+            return postNoSelection();
+        const map = buildTextMap();
+        const start = pointToOffset(map, range.startContainer, range.startOffset);
+        const end = pointToOffset(map, range.endContainer, range.endOffset);
+        if (start < 0 || end < 0 || end <= start)
+            return postNoSelection();
+        const quote = map.text.slice(start, end);
+        if (!quote.trim())
+            return postNoSelection();
+        // Going-forward disambiguator: how many whitespace-tolerant matches of the
+        // quote precede the selection. Resolution prefers this ordinal on context
+        // ties, so a phrase repeated a hundred times still re-anchors exactly.
+        const re = quoteRegex(quote);
+        let occurrence = 0;
+        let m;
+        while ((m = re.exec(map.text)) !== null) {
+            if (m.index >= start)
+                break;
+            occurrence++;
+            if (m[0].length === 0)
+                re.lastIndex++;
+        }
+        // Selection rect in iframe-viewport coordinates so the parent can float its
+        // "Comment" pill at the selection instead of a docked fallback corner.
+        const box = range.getBoundingClientRect();
+        post({
+            type: 'artifactory-comment-selection',
+            anchor: {
+                quote,
+                prefix: map.text.slice(Math.max(0, start - CONTEXT_CHARS), start),
+                suffix: map.text.slice(end, end + CONTEXT_CHARS),
+                startOffset: start,
+                endOffset: end,
+                occurrence,
+            },
+            rect: { top: box.top, left: box.left, bottom: box.bottom, width: box.width, height: box.height },
+        });
+    }
+    document.addEventListener('mouseup', () => {
+        setTimeout(onSelection, 0);
+    }, true);
+    document.addEventListener('click', (e) => {
+        if (!commentMode)
+            return;
+        const sel = window.getSelection();
+        if (sel && !sel.isCollapsed)
+            return;
+        const ev = e;
+        const x = ev.clientX;
+        const y = ev.clientY;
+        let hit = null;
+        for (const id in ranges) {
+            const rects = ranges[id].getClientRects();
+            for (let j = 0; j < rects.length; j++) {
+                const rc = rects[j];
+                if (x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom) {
+                    hit = id;
+                    break;
+                }
+            }
+            if (hit)
+                break;
+        }
+        if (hit) {
+            e.preventDefault();
+            e.stopPropagation();
+            // The click event fires before the mouseup-scheduled onSelection timeout
+            // runs, so setting the flag here reliably suppresses that one
+            // anchor:null post.
+            skipNoSelection = true;
+            post({ type: 'artifactory-comment-click', commentId: hit });
+        }
+    }, true);
+    window.addEventListener('message', (e) => {
+        const d = e.data;
+        if (!d)
+            return;
+        if (d.type === 'artifactory-comment-highlights') {
+            anchors = d.anchors || [];
+            activeId = d.activeId || null;
+            rerender();
+        }
+        else if (d.type === 'artifactory-comment-mode') {
+            commentMode = !!d.enabled;
+            if (commentMode)
+                startObserving();
+            else
+                stopObserving();
+            rerender();
+        }
+        else if (d.type === 'artifactory-comment-scrollto') {
+            const r = ranges[d.commentId];
+            if (r) {
+                let el = r.startContainer;
+                if (el && el.nodeType !== 1)
+                    el = el.parentElement;
+                if (el && el.scrollIntoView) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            }
+        }
+    });
+    // Overlay needs no special browser API, so highlighting is always supported.
+    post({ type: 'artifactory-comment-ready', highlightsSupported: true });
+})();</script>
+<!-- __artifactory_anchor_fix__ -->
+<script>(function(){document.addEventListener("click",function(e){var a=e.target&&e.target.closest&&e.target.closest('a[href^="#"]');if(!a||a.hasAttribute("target"))return;var href=a.getAttribute("href");if(!href||href==="#")return;var id=href.slice(1);var el=document.getElementById(id)||document.querySelector('[name="'+CSS.escape(id)+'"]');if(!el)return;e.preventDefault();el.scrollIntoView({behavior:"smooth",block:"start"});try{history.pushState(null,"","#"+id);}catch(_){}},true);})();</script>
+<base target="_blank">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Customer Success Operations Cockpit — Portfolio Project</title>
+<style>
+:root{
+  /* Dieter Rams cool — SK4 amber on true gray (neutral, Restrained) */
+  --paper:  oklch(94.6% 0 0);
+  --panel:  oklch(97.6% 0 0);
+  --ink:    oklch(20.0% 0 0);
+  --mute:   oklch(50.5% 0 0);
+  --line:   oklch(78.0% 0 0);
+  --accent: oklch(52.0% 0.130 55.0);
+  --accent-weak: color-mix(in oklch, var(--accent) 14%, var(--paper));
+  --ok:   oklch(47.5% 0.100 147.7);
+  --warn: oklch(58.0% 0.120 70.0);
+  --bad:  oklch(46.5% 0.147 24.9);
+
+  --font: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+  --s1:.25rem; --s2:.5rem; --s3:.75rem; --s4:1rem; --s5:1.5rem; --s6:2rem; --s7:3rem; --s8:4rem; --s9:6rem;
+
+  --step--1: clamp(.8rem,.78rem+.1vw,.86rem);
+  --step-0:  clamp(1rem,.96rem+.15vw,1.08rem);
+  --step-1:  clamp(1.2rem,1.1rem+.4vw,1.4rem);
+  --step-2:  clamp(1.5rem,1.3rem+.8vw,2rem);
+  --step-3:  clamp(2rem,1.6rem+1.4vw,2.9rem);
+  --step-4:  clamp(2.6rem,2rem+2.4vw,4rem);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+html,body{overflow-x:clip}
+body{
+  margin:0;min-height:100svh;background:var(--paper);color:var(--ink);
+  font-family:var(--font);font-size:var(--step-0);line-height:1.55;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+}
+.page{width:100%;min-height:100dvh;padding:0}
+.wrap{width:100%;max-width:80rem;margin-inline:auto;padding-inline:clamp(1rem,4vw,3rem)}
+.col{max-width:64ch}
+h1,h2,h3{line-height:1.1;letter-spacing:-.02em;text-wrap:balance;margin:0}
+p{text-wrap:pretty}
+a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:3px}
+img,svg{display:block;max-width:100%;height:auto}
+.mono{font-family:var(--mono)}
+.kicker{font-family:var(--mono);font-size:var(--step--1);letter-spacing:.14em;text-transform:uppercase;color:var(--mute)}
+.num{font-variant-numeric:tabular-nums}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ---- masthead ---- */
+.masthead{border-bottom:2px solid var(--ink);background:var(--panel)}
+.masthead .wrap{padding-block:var(--s6) var(--s5)}
+.mast-top{display:flex;justify-content:space-between;align-items:baseline;gap:var(--s4);flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:var(--s3);margin-bottom:var(--s5)}
+.mast-top .id{font-family:var(--mono);font-size:var(--step--1);color:var(--mute);letter-spacing:.06em}
+.mast-top .id b{color:var(--ink);font-weight:600}
+h1{font-size:var(--step-4);font-weight:700;max-width:20ch}
+.lede{font-size:var(--step-1);color:var(--ink);max-width:52ch;margin-top:var(--s4);line-height:1.4}
+.chips{display:flex;gap:var(--s2);flex-wrap:wrap;margin-top:var(--s5)}
+.chip{font-family:var(--mono);font-size:var(--step--1);letter-spacing:.04em;border:1px solid var(--line);padding:.3em .7em;color:var(--mute)}
+.chip b{color:var(--ink);font-weight:600}
+
+/* ---- byline ---- */
+.byline{display:flex;align-items:baseline;gap:var(--s2) var(--s4);flex-wrap:wrap;margin-top:var(--s5);padding-top:var(--s4);border-top:1px solid var(--line);font-family:var(--mono);font-size:var(--step--1);color:var(--mute);letter-spacing:.04em}
+.byline .who{color:var(--ink);font-weight:600;letter-spacing:.02em}
+.byline .dot{color:var(--line)}
+.byline a{color:var(--accent);text-decoration:none;border-bottom:1px solid var(--line)}
+.byline a:hover{border-bottom-color:var(--accent)}
+
+/* ---- build story ---- */
+.build{background:var(--panel);border-bottom:1px solid var(--line)}
+.build .wrap{padding-block:var(--s7)}
+.build .eyebrow{font-family:var(--mono);font-size:var(--step--1);letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin-bottom:var(--s3)}
+.build h2{font-size:var(--step-2);font-weight:700;max-width:24ch;margin-bottom:var(--s4)}
+.build p{max-width:64ch;color:var(--ink);margin-bottom:var(--s4);line-height:1.55}
+.build p .mute{color:var(--mute)}
+.steps{list-style:none;counter-reset:step;display:grid;gap:var(--s4);margin-top:var(--s6);grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+.steps li{position:relative;border:1px solid var(--line);background:var(--paper);padding:var(--s5) var(--s4) var(--s4);counter-increment:step}
+.steps li::before{content:counter(step,decimal-leading-zero);font-family:var(--mono);font-size:var(--step-1);color:var(--accent);font-weight:600;display:block;margin-bottom:var(--s2)}
+.steps li h4{font-size:var(--step-0);font-weight:600;margin-bottom:var(--s1)}
+.steps li p{font-size:var(--step--1);color:var(--mute);max-width:none;margin:0;line-height:1.45}
+.steps li .tool{font-family:var(--mono);font-size:calc(var(--step--1) * .92);color:var(--ink);display:block;margin-top:var(--s2);letter-spacing:.03em}
+
+/* ---- section frame ---- */
+section{padding-block:var(--s8)}
+section + section{border-top:1px solid var(--line)}
+.sec-head{display:flex;align-items:baseline;gap:var(--s4);margin-bottom:var(--s6);flex-wrap:wrap}
+.sec-head h2{font-size:var(--step-3);font-weight:700}
+.sec-head .n{font-family:var(--mono);color:var(--accent);font-size:var(--step-1);font-weight:600}
+.sec-intro{color:var(--ink);max-width:64ch;margin-top:0}
+
+/* ---- KPI strip ---- */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));gap:1px;background:var(--line);border:1px solid var(--line)}
+.kpi{background:var(--panel);padding:var(--s5)}
+.kpi .lab{font-family:var(--mono);font-size:var(--step--1);letter-spacing:.08em;text-transform:uppercase;color:var(--mute)}
+.kpi .val{font-family:var(--mono);font-size:var(--step-3);font-weight:600;line-height:1;margin-top:var(--s3);letter-spacing:-.02em}
+.kpi .sub{font-size:var(--step--1);color:var(--mute);margin-top:var(--s2)}
+.kpi.alert .val{color:var(--accent)}
+
+/* ---- panels / charts ---- */
+.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(20rem,1fr));gap:var(--s5)}
+.panel{border:1px solid var(--line);background:var(--panel);padding:var(--s5)}
+.panel h3{font-size:var(--step-1);font-weight:700;margin-bottom:var(--s2)}
+.panel .cap{font-family:var(--mono);font-size:var(--step--1);color:var(--mute);margin-bottom:var(--s4);letter-spacing:.03em}
+.afy-chart{display:block;width:100%;height:auto;overflow:visible}
+.afy-chart .afy-axis{stroke:var(--line)}
+.afy-chart .afy-tick{fill:var(--mute);font-family:var(--mono);font-size:10px}
+.afy-chart .afy-label{fill:var(--mute);font-family:var(--font);font-size:11px}
+.afy-chart .afy-series-0{fill:var(--accent);stroke:var(--accent)}
+.afy-chart .afy-series-1{fill:var(--mute);stroke:var(--mute)}
+
+/* ---- SQL blocks ---- */
+.sql{border:1px solid var(--line);background:var(--panel);margin-top:var(--s4)}
+.sql .bar{display:flex;justify-content:space-between;align-items:center;gap:var(--s3);border-bottom:1px solid var(--line);padding:var(--s3) var(--s4);background:var(--paper)}
+.sql .bar .t{font-family:var(--mono);font-size:var(--step--1);font-weight:600;letter-spacing:.04em}
+.sql .bar .tag{font-family:var(--mono);font-size:var(--step--1);color:var(--mute)}
+.sql pre{margin:0;padding:var(--s4) var(--s5);overflow-x:auto;font-family:var(--mono);font-size:var(--step--1);line-height:1.6;color:var(--ink)}
+.sql pre .kw{color:var(--accent);font-weight:600}
+.sql pre .c{color:var(--mute);font-style:italic}
+.sql .why{border-top:1px solid var(--line);padding:var(--s3) var(--s5);font-size:var(--step--1);color:var(--mute)}
+.sql .why b{color:var(--ink);font-weight:600}
+
+/* ---- workflow flow ---- */
+.flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));gap:var(--s3);margin-top:var(--s5);counter-reset:step}
+.flow .node{border:1px solid var(--line);background:var(--panel);padding:var(--s4);position:relative}
+.flow .node .st{font-family:var(--mono);font-size:var(--step--1);color:var(--accent);letter-spacing:.06em}
+.flow .node h4{margin:var(--s2) 0 0;font-size:var(--step-0);font-weight:700}
+.flow .node p{margin:var(--s2) 0 0;font-size:var(--step--1);color:var(--mute);line-height:1.45}
+.flow .node.ai{border-color:var(--accent);border-width:1px;background:var(--accent-weak)}
+
+/* ---- agent cards ---- */
+.agents{display:grid;grid-template-columns:repeat(auto-fit,minmax(17rem,1fr));gap:1px;background:var(--line);border:1px solid var(--line);margin-top:var(--s5)}
+.agent{background:var(--panel);padding:var(--s5)}
+.agent .tag{font-family:var(--mono);font-size:var(--step--1);letter-spacing:.06em;color:var(--accent);text-transform:uppercase}
+.agent h3{font-size:var(--step-1);font-weight:700;margin:var(--s2) 0 var(--s3)}
+.agent p{font-size:var(--step--1);color:var(--mute);margin:0 0 var(--s3);line-height:1.5}
+.agent dl{margin:0;font-size:var(--step--1);display:grid;grid-template-columns:auto 1fr;gap:var(--s1) var(--s3)}
+.agent dt{font-family:var(--mono);color:var(--mute);letter-spacing:.03em}
+.agent dd{margin:0;color:var(--ink)}
+
+/* ---- checklist ---- */
+.playbook{border:1px solid var(--line);background:var(--panel);margin-top:var(--s5)}
+.playbook li{display:flex;gap:var(--s3);align-items:flex-start;padding:var(--s4) var(--s5);list-style:none}
+.playbook li + li{border-top:1px solid var(--line)}
+.playbook ol{margin:0;padding:0;counter-reset:pb}
+.playbook input[type=checkbox]{margin-top:.25em;width:1.1rem;height:1.1rem;accent-color:var(--accent);flex:none}
+.playbook .txt strong{display:block;font-weight:700}
+.playbook .txt span{font-size:var(--step--1);color:var(--mute)}
+
+/* ---- data source note / states ---- */
+.src{font-family:var(--mono);font-size:var(--step--1);color:var(--mute);margin-top:var(--s4)}
+.note{border:1px dashed var(--line);padding:var(--s4) var(--s5);color:var(--mute);font-size:var(--step--1);background:var(--panel)}
+
+/* ---- live account table ---- */
+.tbl-wrap{overflow-x:auto;border:1px solid var(--line);margin-top:var(--s4)}
+table.acc{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;font-size:var(--step--1);background:var(--panel)}
+table.acc th,table.acc td{padding:var(--s2) var(--s3);text-align:left;white-space:nowrap}
+table.acc thead th{position:sticky;top:0;background:var(--paper);color:var(--mute);font-family:var(--mono);font-weight:600;letter-spacing:.04em;border-bottom:1px solid var(--ink);text-transform:uppercase;font-size:.72rem}
+table.acc td.n,table.acc th.n{text-align:right}
+table.acc tbody tr + tr td{border-top:1px solid color-mix(in oklch,var(--line) 60%,var(--paper))}
+table.acc tbody tr:hover td{background:var(--paper)}
+.band{font-family:var(--mono);font-size:.72rem;letter-spacing:.03em;padding:.15em .5em;border:1px solid currentColor}
+.band.Healthy{color:var(--ok)} .band.Watch{color:var(--warn)} .band[class*=Risk]{color:var(--accent)}
+.hbar{display:inline-block;height:.55rem;background:var(--accent);vertical-align:middle;min-width:2px}
+.controls{display:flex;gap:var(--s3);flex-wrap:wrap;align-items:center;margin-top:var(--s4)}
+.controls label{font-family:var(--mono);font-size:var(--step--1);color:var(--mute);letter-spacing:.04em}
+.controls select,.controls input{font-family:var(--mono);font-size:var(--step--1);padding:.35em .5em;border:1px solid var(--line);background:var(--panel);color:var(--ink)}
+
+.stack > * + *{margin-top:var(--s4)}
+.two{display:grid;grid-template-columns:1.2fr .8fr;gap:var(--s7);align-items:start}
+@media(max-width:820px){.two{grid-template-columns:1fr;gap:var(--s6)}}
+
+.afy-table{border-collapse:collapse;width:100%}
+.afy-table caption{text-align:left;color:var(--mute);padding-bottom:var(--s3);font-family:var(--mono);font-size:var(--step--1)}
+.afy-table th,.afy-table td{padding:var(--s2) var(--s3);border-bottom:1px solid var(--line);text-align:left}
+.afy-table th{font-weight:600}
+.afy-table thead th{border-bottom:2px solid var(--mute);font-family:var(--mono);font-size:var(--step--1);text-transform:uppercase;letter-spacing:.04em;color:var(--mute)}
+.afy-table .num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+footer{border-top:2px solid var(--ink);background:var(--panel)}
+footer .wrap{padding-block:var(--s6);display:flex;justify-content:space-between;gap:var(--s4);flex-wrap:wrap;font-family:var(--mono);font-size:var(--step--1);color:var(--mute);letter-spacing:.03em}
+footer b{color:var(--ink);font-weight:600}
+.legend{font-family:var(--mono);font-size:var(--step--1);color:var(--mute);display:flex;gap:var(--s4);flex-wrap:wrap;margin-top:var(--s3)}
+.legend .sw{display:inline-block;width:.8em;height:.8em;vertical-align:middle;margin-right:.35em;border:1px solid var(--ink)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div class="page">
+
+<!-- ============ MASTHEAD ============ -->
+<header class="masthead">
+  <div class="wrap">
+    <div class="mast-top">
+      <span class="id">PORTFOLIO PROJECT · <b>CS-OPS-01</b> · Customer Success &amp; Client Operations</span>
+      <span class="id">Synthetic data · Northstar SaaS (fictional) · FY snapshot</span>
+    </div>
+    <p class="kicker">Book of business — 48 B2B accounts · $6.67M ARR</p>
+    <h1>Customer Success Operations Cockpit</h1>
+    <p class="lede">A working demonstration: raw account data modeled in SQL, turned into a health &amp; renewal dashboard, and wired to an agentic-AI layer that drafts the next action for each at-risk account.</p>
+    <div class="chips">
+      <span class="chip"><b>SQL</b> health scoring · churn risk · QBR prep</span>
+      <span class="chip"><b>Dashboards</b> live account table</span>
+      <span class="chip"><b>Agentic AI</b> triage &amp; drafting workflow</span>
+      <span class="chip"><b>Role</b> B2B CSM / Client Operations</span>
+    </div>
+    <p class="byline">
+      <span class="who">iarbanik</span>
+      <span class="dot">·</span> Customer Success &amp; Client Operations
+      <span class="dot">·</span> portfolio project
+      <span class="dot">·</span> data, SQL, dashboard &amp; agentic workflow designed &amp; built by me
+    </p>
+  </div>
+</header>
+
+<!-- ============ HOW I BUILT THIS ============ -->
+<section class="build">
+  <div class="wrap">
+    <p class="eyebrow">How I built this</p>
+    <h2>From raw account data to an action a CSM can take</h2>
+    <p>I built this end to end to show how I actually work a book of business — not just describe it. I started from a flat export of 48 B2B SaaS accounts and treated it the way a Customer Success or Client Operations team would: <b>model it, measure it, surface it, and act on it.</b> The dashboard below is populated from that same dataset, so the numbers on this page are the numbers in the data.</p>
+    <p>The through-line is judgment at scale. SQL turns messy account data into a single defensible <b>health score</b> and a <b>dollar-weighted risk queue</b>; the dashboard makes that queue something a team can trust and re-sort in seconds; and an <b>agentic-AI layer</b> drafts the next move for each at-risk account — while a human stays the one who decides and sends. <span class="mute">Data is synthetic and every account name is fictional, so it is safe to share publicly.</span></p>
+    <ol class="steps">
+      <li>
+        <h4>Model the data</h4>
+        <p>Defined the account schema and a weighted composite health score from adoption, support load, sentiment and tenure.</p>
+        <span class="tool">SQL · data modeling</span>
+      </li>
+      <li>
+        <h4>Find the risk</h4>
+        <p>Ranked a churn-risk work queue by dollars &times; renewal urgency, and rolled the book up by CSM to balance coverage.</p>
+        <span class="tool">SQL · aggregation</span>
+      </li>
+      <li>
+        <h4>Surface it</h4>
+        <p>Turned the queries into a health &amp; renewal dashboard — KPIs, charts, and a filterable, sortable account table.</p>
+        <span class="tool">Dashboard · HTML/JS/SVG</span>
+      </li>
+      <li>
+        <h4>Act on it</h4>
+        <p>Designed agents that triage risk and draft save-plays, QBR prep and expansion outreach — human-in-the-loop by default.</p>
+        <span class="tool">Agentic AI · human review</span>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<!-- ============ 1 · THE FINDING ============ -->
+<section>
+  <div class="wrap">
+    <div class="sec-head"><span class="n">01</span><h2>What the book of business tells us</h2></div>
+    <p class="sec-intro col">The lead metric is not a vanity number — it is the concentration of revenue in accounts that are drifting. Eleven accounts carry an <b>At&nbsp;Risk</b> health band, and together they hold nearly a third of total ARR. That is the queue this cockpit is built to work down.</p>
+
+    <div class="kpis" style="margin-top:var(--s6)">
+      <div class="kpi"><div class="lab">Total ARR</div><div class="val num">$6.67M</div><div class="sub">48 active accounts</div></div>
+      <div class="kpi alert"><div class="lab">ARR at risk</div><div class="val num">$2.16M</div><div class="sub">11 accounts · 32% of ARR</div></div>
+      <div class="kpi"><div class="lab">Avg health score</div><div class="val num">64.3</div><div class="sub">composite, 0–100</div></div>
+      <div class="kpi alert"><div class="lab">Renewals &le; 90 days</div><div class="val num">9</div><div class="sub">need a plan now</div></div>
+      <div class="kpi"><div class="lab">Expansion pipeline</div><div class="val num">$925K</div><div class="sub">open opportunities</div></div>
+    </div>
+
+    <div class="grid-2" style="margin-top:var(--s6)">
+      <div class="panel">
+        <h3>Revenue exposure by risk band</h3>
+        <p class="cap">Where the ARR actually sits — $K</p>
+<svg class="afy-chart" viewBox="0 0 720 280" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>ARR by risk band ($K)</title>
+<desc>Healthy 1,391K; Watch 3,125K; At Risk 2,155K</desc>
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="46" y="249" text-anchor="end">0</text>
+<line class="afy-axis" x1="52" y1="199.2" x2="708" y2="199.2" />
+<text class="afy-tick" x="46" y="202.2" text-anchor="end">625</text>
+<line class="afy-axis" x1="52" y1="152.4" x2="708" y2="152.4" />
+<text class="afy-tick" x="46" y="155.4" text-anchor="end">1250</text>
+<line class="afy-axis" x1="52" y1="105.6" x2="708" y2="105.6" />
+<text class="afy-tick" x="46" y="108.6" text-anchor="end">1875</text>
+<line class="afy-axis" x1="52" y1="58.8" x2="708" y2="58.8" />
+<text class="afy-tick" x="46" y="61.8" text-anchor="end">2500</text>
+<line class="afy-axis" x1="52" y1="12" x2="708" y2="12" />
+<text class="afy-tick" x="46" y="15" text-anchor="end">3125</text>
+<rect class="afy-series-0" x="71.68" y="141.84" width="179.31" height="104.16" />
+<rect class="afy-series-0" x="290.35" y="12" width="179.31" height="234" />
+<rect class="afy-series-0" x="509.01" y="84.63" width="179.31" height="161.37" />
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="161.33" y="260" text-anchor="middle">Healthy</text>
+<text class="afy-tick" x="380" y="260" text-anchor="middle">Watch</text>
+<text class="afy-tick" x="598.67" y="260" text-anchor="middle">At Risk</text>
+</svg>
+      </div>
+      <div class="panel">
+        <h3>Adoption vs. health, by lifecycle stage</h3>
+        <p class="cap">The two move together — adoption is the leading indicator</p>
+<svg class="afy-chart" viewBox="0 0 720 280" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Adoption vs health by lifecycle stage</title>
+<desc>Average feature adoption % and average health score per lifecycle stage</desc>
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="46" y="249" text-anchor="end">0</text>
+<line class="afy-axis" x1="52" y1="201.6" x2="708" y2="201.6" />
+<text class="afy-tick" x="46" y="204.6" text-anchor="end">16</text>
+<line class="afy-axis" x1="52" y1="157.2" x2="708" y2="157.2" />
+<text class="afy-tick" x="46" y="160.2" text-anchor="end">31</text>
+<line class="afy-axis" x1="52" y1="112.8" x2="708" y2="112.8" />
+<text class="afy-tick" x="46" y="115.8" text-anchor="end">47</text>
+<line class="afy-axis" x1="52" y1="68.4" x2="708" y2="68.4" />
+<text class="afy-tick" x="46" y="71.4" text-anchor="end">62</text>
+<line class="afy-axis" x1="52" y1="24" x2="708" y2="24" />
+<text class="afy-tick" x="46" y="27" text-anchor="end">78</text>
+<rect class="afy-series-0" x="63.81" y="43.35" width="47.34" height="202.65" />
+<rect class="afy-series-1" x="117.6" y="62.14" width="47.34" height="183.86" />
+<rect class="afy-series-0" x="195.01" y="24" width="47.34" height="222" />
+<rect class="afy-series-1" x="248.8" y="43.64" width="47.34" height="202.36" />
+<rect class="afy-series-0" x="326.21" y="24" width="47.34" height="222" />
+<rect class="afy-series-1" x="380" y="53.6" width="47.34" height="192.4" />
+<rect class="afy-series-0" x="457.41" y="175.7" width="47.34" height="70.3" />
+<rect class="afy-series-1" x="511.2" y="119.06" width="47.34" height="126.94" />
+<rect class="afy-series-0" x="588.61" y="144.68" width="47.34" height="101.32" />
+<rect class="afy-series-1" x="642.4" y="119.63" width="47.34" height="126.37" />
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="117.6" y="260" text-anchor="middle">Onboarding</text>
+<text class="afy-tick" x="248.8" y="260" text-anchor="middle">Adopting</text>
+<text class="afy-tick" x="380" y="260" text-anchor="middle">Established</text>
+<text class="afy-tick" x="511.2" y="260" text-anchor="middle">At Risk</text>
+<text class="afy-tick" x="642.4" y="260" text-anchor="middle">Renewal Due</text>
+<rect class="afy-series-0" x="52" y="12" width="8" height="8" />
+<text class="afy-label" x="64" y="19">avg_adoption</text>
+<rect class="afy-series-1" x="160" y="12" width="8" height="8" />
+<text class="afy-label" x="172" y="19">avg_health</text>
+</svg>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 2 · SQL ============ -->
+<section>
+  <div class="wrap">
+    <div class="sec-head"><span class="n">02</span><h2>The SQL behind the numbers</h2></div>
+    <p class="sec-intro col">Every metric above is derived, not hand-entered. These are the queries a CSM/ops analyst would run against the account table — a health score composite, a churn-risk queue, and a QBR one-pager. They read against a table with the same columns as the dashboard below.</p>
+
+    <div class="sql">
+      <div class="bar"><span class="t">health_score.sql</span><span class="tag">composite score · 0–100</span></div>
+<pre><span class="c">-- Weighted account health: adoption + support load + sentiment + sponsorship</span>
+<span class="kw">SELECT</span>
+  account, tier, csm, arr_usd,
+  <span class="kw">ROUND</span>(
+      0.45 * adoption_pct
+    + 0.15 * <span class="kw">GREATEST</span>(0, 100 - open_tickets * 8)
+    + 0.20 * (csat * 20)
+    + 0.12 * ((nps + 100) / 2.0)
+    + 0.08 * <span class="kw">CASE WHEN</span> exec_sponsor = 'Yes' <span class="kw">THEN</span> 100 <span class="kw">ELSE</span> 40 <span class="kw">END</span>
+  , 1) <span class="kw">AS</span> health_score
+<span class="kw">FROM</span> accounts
+<span class="kw">ORDER BY</span> health_score <span class="kw">ASC</span>;</pre>
+      <div class="why"><b>Why it matters:</b> one number the whole team trusts, built from signals a CSM can actually influence — so "unhealthy" always points at a lever, not just a mood.</div>
+    </div>
+
+    <div class="sql">
+      <div class="bar"><span class="t">churn_risk_queue.sql</span><span class="tag">the daily work queue</span></div>
+<pre><span class="c">-- Accounts to touch first: at-risk band, weighted by ARR and renewal urgency</span>
+<span class="kw">SELECT</span>
+  account, csm, arr_usd, health_score, renewal_in_days,
+  <span class="kw">CASE</span>
+    <span class="kw">WHEN</span> renewal_in_days &lt; 0            <span class="kw">THEN</span> 'OVERDUE'
+    <span class="kw">WHEN</span> renewal_in_days &lt;= 90         <span class="kw">THEN</span> 'URGENT'
+    <span class="kw">ELSE</span> 'MONITOR'
+  <span class="kw">END</span> <span class="kw">AS</span> renewal_flag
+<span class="kw">FROM</span> accounts
+<span class="kw">WHERE</span> risk_band = 'At Risk'
+   <span class="kw">OR</span> (health_score &lt; 60 <span class="kw">AND</span> renewal_in_days &lt;= 90)
+<span class="kw">ORDER BY</span> (renewal_in_days &lt;= 90) <span class="kw">DESC</span>, arr_usd <span class="kw">DESC</span>;</pre>
+      <div class="why"><b>Why it matters:</b> prioritization is the CSM's scarcest resource. This ranks the day's work by <b>dollars &times; urgency</b>, not by whoever emailed last.</div>
+    </div>
+
+    <div class="sql">
+      <div class="bar"><span class="t">book_of_business.sql</span><span class="tag">CSM performance rollup</span></div>
+<pre><span class="c">-- Portfolio view: coverage, average health, and at-risk load per CSM</span>
+<span class="kw">SELECT</span>
+  csm,
+  <span class="kw">COUNT</span>(*)                                   <span class="kw">AS</span> accounts,
+  <span class="kw">ROUND</span>(<span class="kw">SUM</span>(arr_usd) / 1000)                  <span class="kw">AS</span> arr_k,
+  <span class="kw">ROUND</span>(<span class="kw">AVG</span>(health_score), 1)               <span class="kw">AS</span> avg_health,
+  <span class="kw">SUM</span>(<span class="kw">CASE WHEN</span> risk_band = 'At Risk'
+           <span class="kw">THEN</span> 1 <span class="kw">ELSE</span> 0 <span class="kw">END</span>)               <span class="kw">AS</span> at_risk
+<span class="kw">FROM</span> accounts
+<span class="kw">GROUP BY</span> csm
+<span class="kw">ORDER BY</span> arr_k <span class="kw">DESC</span>;</pre>
+      <div class="why"><b>Why it matters:</b> the same data that runs an account also balances a team — who is carrying the heaviest at-risk load, where to rebalance coverage.</div>
+    </div>
+
+    <p class="sec-intro col" style="margin-top:var(--s6)">Two of those queries are materialized directly below as the dashboard the team actually looks at.</p>
+
+    <div class="grid-2" style="margin-top:var(--s5)">
+      <div class="panel">
+        <h3>Book of business — by CSM</h3>
+        <p class="cap">Output of <span class="mono">book_of_business.sql</span></p>
+<table class="afy-table">
+<caption>Coverage and health per CSM (ARR in $K)</caption>
+<thead>
+<tr>
+<th scope="col">csm</th>
+<th scope="col" class="num">accounts</th>
+<th scope="col" class="num">arr_k</th>
+<th scope="col" class="num">avg_health</th>
+<th scope="col" class="num">at_risk</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>S. Bianchi</td><td class="num">14</td><td class="num">1922</td><td class="num">67.7</td><td class="num">2</td></tr>
+<tr><td>D. Haddad</td><td class="num">8</td><td class="num">1294</td><td class="num">59.9</td><td class="num">3</td></tr>
+<tr><td>J. Reyes</td><td class="num">10</td><td class="num">1272</td><td class="num">66.3</td><td class="num">2</td></tr>
+<tr><td>A. Okafor</td><td class="num">8</td><td class="num">1178</td><td class="num">63.6</td><td class="num">1</td></tr>
+<tr><td>M. Novak</td><td class="num">8</td><td class="num">1005</td><td class="num">61.1</td><td class="num">3</td></tr>
+</tbody>
+</table>
+      </div>
+      <div class="panel">
+        <h3>Health by tier</h3>
+        <p class="cap">Smaller accounts adopt fastest; enterprise needs the most attention</p>
+<svg class="afy-chart" viewBox="0 0 720 280" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Average health score by tier</title>
+<desc>Enterprise 60.2, Mid-Market 63.8, SMB 68.0</desc>
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="46" y="249" text-anchor="end">0</text>
+<line class="afy-axis" x1="52" y1="199.2" x2="708" y2="199.2" />
+<text class="afy-tick" x="46" y="202.2" text-anchor="end">14</text>
+<line class="afy-axis" x1="52" y1="152.4" x2="708" y2="152.4" />
+<text class="afy-tick" x="46" y="155.4" text-anchor="end">27</text>
+<line class="afy-axis" x1="52" y1="105.6" x2="708" y2="105.6" />
+<text class="afy-tick" x="46" y="108.6" text-anchor="end">41</text>
+<line class="afy-axis" x1="52" y1="58.8" x2="708" y2="58.8" />
+<text class="afy-tick" x="46" y="61.8" text-anchor="end">54</text>
+<line class="afy-axis" x1="52" y1="12" x2="708" y2="12" />
+<text class="afy-tick" x="46" y="15" text-anchor="end">68</text>
+<rect class="afy-series-0" x="71.68" y="38.84" width="179.31" height="207.16" />
+<rect class="afy-series-0" x="290.35" y="26.45" width="179.31" height="219.55" />
+<rect class="afy-series-0" x="509.01" y="12" width="179.31" height="234" />
+<line class="afy-axis" x1="52" y1="246" x2="708" y2="246" />
+<text class="afy-tick" x="161.33" y="260" text-anchor="middle">Enterprise</text>
+<text class="afy-tick" x="380" y="260" text-anchor="middle">Mid-Market</text>
+<text class="afy-tick" x="598.67" y="260" text-anchor="middle">SMB</text>
+</svg>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 3 · DASHBOARD ============ -->
+<section>
+  <div class="wrap">
+    <div class="sec-head"><span class="n">03</span><h2>Account health dashboard</h2></div>
+    <p class="sec-intro col">This table is built from the 48-account dataset embedded in this page. Filter to a risk band or a CSM, search by account name, and sort by any column.</p>
+
+    <div class="controls" role="group" aria-label="Dashboard filters">
+      <label for="f-risk">RISK</label>
+      <select id="f-risk"><option value="">all bands</option><option>At Risk</option><option>Watch</option><option>Healthy</option></select>
+      <label for="f-csm">CSM</label>
+      <select id="f-csm"><option value="">all CSMs</option></select>
+      <label for="f-q">FIND</label>
+      <input id="f-q" type="search" placeholder="account name…" autocomplete="off">
+      <span id="count" class="mono" style="color:var(--mute)"></span>
+    </div>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--ok)"></span>Healthy &ge; 75</span>
+      <span><span class="sw" style="background:var(--warn)"></span>Watch 55–74</span>
+      <span><span class="sw" style="background:var(--accent)"></span>At Risk &lt; 55</span>
+    </div>
+
+    <div id="dash" class="tbl-wrap" aria-live="polite"></div>
+    <p class="src">Data: 48 synthetic B2B accounts, embedded in this page as JSON. All account names are fictional.</p>
+  </div>
+</section>
+
+<!-- ============ 4 · AGENTIC AI ============ -->
+<section>
+  <div class="wrap">
+    <div class="sec-head"><span class="n">04</span><h2>The agentic-AI layer</h2></div>
+    <p class="sec-intro col">The SQL finds the accounts; the dashboard shows them. The point of leverage in modern client operations is what happens <b>next</b> — and that is where a small crew of purpose-built agents earns its keep. Each one takes the queue as input and produces a reviewable draft, never an un-checked action.</p>
+
+    <div class="flow" role="list" aria-label="Agentic workflow">
+      <div class="node" role="listitem"><span class="st">STEP 01</span><h4>Signal ingest</h4><p>Nightly pull of usage, tickets, CSAT/NPS into the account table.</p></div>
+      <div class="node" role="listitem"><span class="st">STEP 02</span><h4>Score &amp; rank</h4><p>SQL recomputes health and builds the churn-risk queue.</p></div>
+      <div class="node ai" role="listitem"><span class="st">STEP 03 · AI</span><h4>Triage agent</h4><p>Reads the queue, clusters root causes, tags each account.</p></div>
+      <div class="node ai" role="listitem"><span class="st">STEP 04 · AI</span><h4>Draft agent</h4><p>Writes the outreach / QBR / save-play draft for the CSM.</p></div>
+      <div class="node" role="listitem"><span class="st">STEP 05</span><h4>CSM review</h4><p>Human edits, approves, sends. Outcome logged back to the table.</p></div>
+    </div>
+
+    <div class="agents">
+      <div class="agent">
+        <span class="tag">Agent · triage</span>
+        <h3>Risk Triage Agent</h3>
+        <p>Groups the at-risk queue by likely root cause — low adoption, support friction, lost sponsor, or pricing — so the CSM opens the day with a diagnosis, not a spreadsheet.</p>
+        <dl>
+          <dt>input</dt><dd>churn_risk_queue.sql output</dd>
+          <dt>signal</dt><dd>adoption ↓, tickets ↑, NPS &lt; 0</dd>
+          <dt>output</dt><dd>root-cause tag + one-line rationale</dd>
+        </dl>
+      </div>
+      <div class="agent">
+        <span class="tag">Agent · drafting</span>
+        <h3>Save-Play Drafting Agent</h3>
+        <p>Turns a tagged risk into a specific play: re-onboarding invite, exec business review, or a value-recap email — pre-filled with the account's own numbers.</p>
+        <dl>
+          <dt>input</dt><dd>account row + risk tag</dd>
+          <dt>grounding</dt><dd>account facts only, no invention</dd>
+          <dt>output</dt><dd>editable draft + suggested owner</dd>
+        </dl>
+      </div>
+      <div class="agent">
+        <span class="tag">Agent · prep</span>
+        <h3>QBR Prep Agent</h3>
+        <p>Assembles the quarterly-business-review one-pager: ARR trend, adoption story, open expansion, and the three talking points that matter for that specific account.</p>
+        <dl>
+          <dt>input</dt><dd>book_of_business.sql + history</dd>
+          <dt>output</dt><dd>QBR deck outline + metrics</dd>
+          <dt>human</dt><dd>CSM confirms before the meeting</dd>
+        </dl>
+      </div>
+      <div class="agent">
+        <span class="tag">Agent · expansion</span>
+        <h3>Expansion Scout Agent</h3>
+        <p>Flags healthy, high-adoption accounts with headroom and drafts the expansion motion — the offensive counterpart to the churn queue.</p>
+        <dl>
+          <dt>input</dt><dd>health &ge; 75, adoption &ge; 85</dd>
+          <dt>output</dt><dd>upsell hypothesis + $ estimate</dd>
+          <dt>routes to</dt><dd>CSM + AE for co-sell</dd>
+        </dl>
+      </div>
+    </div>
+
+    <p class="src" style="margin-top:var(--s5)">Design principle: agents <b>draft and rank</b>; the CSM <b>decides and sends</b>. Every step is grounded in the account table so nothing is invented, and every action is logged back so the health score learns from the outcome.</p>
+  </div>
+</section>
+
+<!-- ============ 5 · PLAYBOOK ============ -->
+<section>
+  <div class="wrap">
+    <div class="two">
+      <div>
+        <div class="sec-head"><span class="n">05</span><h2>The renewal-week playbook</h2></div>
+        <p class="sec-intro">A checklist you can actually run — the operational spine that ties the SQL, the dashboard, and the agents into one weekly ritual.</p>
+        <div class="playbook">
+          <ol>
+            <li><input type="checkbox" id="p1"><label class="txt" for="p1"><strong>Refresh the churn-risk queue</strong><span>Run the SQL; sort by dollars × urgency.</span></label></li>
+            <li><input type="checkbox" id="p2"><label class="txt" for="p2"><strong>Review the triage agent's root-cause tags</strong><span>Confirm or correct each diagnosis.</span></label></li>
+            <li><input type="checkbox" id="p3"><label class="txt" for="p3"><strong>Edit &amp; approve the save-play drafts</strong><span>Human voice on every outbound.</span></label></li>
+            <li><input type="checkbox" id="p4"><label class="txt" for="p4"><strong>Lock QBR prep for accounts renewing ≤ 90 days</strong><span>One-pager + three talking points.</span></label></li>
+            <li><input type="checkbox" id="p5"><label class="txt" for="p5"><strong>Route expansion-scout flags to AEs</strong><span>Play offense, not just defense.</span></label></li>
+            <li><input type="checkbox" id="p6"><label class="txt" for="p6"><strong>Log outcomes back to the account table</strong><span>Close the loop; feed next week's score.</span></label></li>
+          </ol>
+        </div>
+      </div>
+      <div class="stack">
+        <div class="panel">
+          <h3>How to read this project</h3>
+          <p class="cap" style="margin-bottom:var(--s3)">for a hiring manager</p>
+          <p style="font-size:var(--step--1);color:var(--mute);line-height:1.55">This one page shows the full arc of a modern CS/client-ops role: <b style="color:var(--ink)">model the data in SQL</b>, <b style="color:var(--ink)">surface it in a dashboard</b> people trust, and <b style="color:var(--ink)">put an agentic-AI layer</b> on top to scale the human's judgment instead of replacing it.</p>
+        </div>
+        <div class="panel">
+          <h3>Skills demonstrated</h3>
+          <div class="legend" style="flex-direction:column;gap:var(--s2);margin-top:var(--s3)">
+            <span>SQL — scoring, ranking, aggregation</span>
+            <span>Dashboarding — live data, filters, charts</span>
+            <span>Churn &amp; renewal risk management</span>
+            <span>QBR &amp; expansion motion design</span>
+            <span>Agentic-AI workflow design</span>
+            <span>Human-in-the-loop governance</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>CS-OPS-01 · Customer Success Operations Cockpit · <b>portfolio project</b></span>
+    <span>Synthetic data · all account names fictional · built by <b>iarbanik</b></span>
+  </div>
+</footer>
+
+</div>
+
+<script>
+const DATA=[
+{"account":"Northwind","tier":"Mid-Market","csm":"A. Okafor","arr_usd":124000,"adoption_pct":68.4,"health_score":72.2,"risk_band":"Watch","renewal_in_days":292,"expansion_arr_usd":0},
+{"account":"Contoso","tier":"Enterprise","csm":"M. Novak","arr_usd":378000,"adoption_pct":35.6,"health_score":44.4,"risk_band":"At Risk","renewal_in_days":-7,"expansion_arr_usd":0},
+{"account":"Fabrikam","tier":"Mid-Market","csm":"S. Bianchi","arr_usd":127000,"adoption_pct":85.2,"health_score":68.8,"risk_band":"Watch","renewal_in_days":12,"expansion_arr_usd":39000},
+{"account":"Globex","tier":"Enterprise","csm":"S. Bianchi","arr_usd":270000,"adoption_pct":37.6,"health_score":58.6,"risk_band":"Watch","renewal_in_days":30,"expansion_arr_usd":0},
+{"account":"Initech","tier":"Mid-Market","csm":"J. Reyes","arr_usd":136000,"adoption_pct":78.8,"health_score":71.7,"risk_band":"Watch","renewal_in_days":301,"expansion_arr_usd":0},
+{"account":"Umbrella","tier":"Mid-Market","csm":"D. Haddad","arr_usd":111000,"adoption_pct":51.1,"health_score":57.0,"risk_band":"Watch","renewal_in_days":195,"expansion_arr_usd":0},
+{"account":"Vandelay","tier":"SMB","csm":"D. Haddad","arr_usd":37000,"adoption_pct":29.3,"health_score":34.4,"risk_band":"At Risk","renewal_in_days":277,"expansion_arr_usd":0},
+{"account":"Stark","tier":"Mid-Market","csm":"S. Bianchi","arr_usd":47000,"adoption_pct":31.1,"health_score":47.4,"risk_band":"At Risk","renewal_in_days":206,"expansion_arr_usd":0},
+{"account":"Wayne","tier":"Mid-Market","csm":"A. Okafor","arr_usd":97000,"adoption_pct":100,"health_score":81.6,"risk_band":"Healthy","renewal_in_days":264,"expansion_arr_usd":0},
+{"account":"Wonka","tier":"Mid-Market","csm":"J. Reyes","arr_usd":88000,"adoption_pct":100,"health_score":78.2,"risk_band":"Healthy","renewal_in_days":44,"expansion_arr_usd":48000},
+{"account":"Acme","tier":"Mid-Market","csm":"D. Haddad","arr_usd":99000,"adoption_pct":93.9,"health_score":73.7,"risk_band":"Watch","renewal_in_days":147,"expansion_arr_usd":0},
+{"account":"Hooli","tier":"SMB","csm":"J. Reyes","arr_usd":37000,"adoption_pct":92.5,"health_score":69.2,"risk_band":"Watch","renewal_in_days":271,"expansion_arr_usd":0},
+{"account":"Pied Piper","tier":"SMB","csm":"A. Okafor","arr_usd":18000,"adoption_pct":62.9,"health_score":61.1,"risk_band":"Watch","renewal_in_days":116,"expansion_arr_usd":0},
+{"account":"Soylent","tier":"Mid-Market","csm":"S. Bianchi","arr_usd":105000,"adoption_pct":100,"health_score":80.9,"risk_band":"Healthy","renewal_in_days":159,"expansion_arr_usd":20000},
+{"account":"Cyberdyne","tier":"Enterprise","csm":"A. Okafor","arr_usd":187000,"adoption_pct":69.1,"health_score":58.2,"risk_band":"Watch","renewal_in_days":171,"expansion_arr_usd":34000},
+{"account":"Massive Dynamic","tier":"Enterprise","csm":"D. Haddad","arr_usd":492000,"adoption_pct":68.1,"health_score":52.2,"risk_band":"At Risk","renewal_in_days":117,"expansion_arr_usd":0},
+{"account":"Aperture","tier":"Enterprise","csm":"S. Bianchi","arr_usd":453000,"adoption_pct":100,"health_score":78.7,"risk_band":"Healthy","renewal_in_days":195,"expansion_arr_usd":0},
+{"account":"Black Mesa","tier":"Enterprise","csm":"M. Novak","arr_usd":319000,"adoption_pct":60.5,"health_score":52.3,"risk_band":"At Risk","renewal_in_days":141,"expansion_arr_usd":0},
+{"account":"Tyrell","tier":"Enterprise","csm":"S. Bianchi","arr_usd":419000,"adoption_pct":91.7,"health_score":78.9,"risk_band":"Healthy","renewal_in_days":25,"expansion_arr_usd":0},
+{"account":"Weyland","tier":"Enterprise","csm":"J. Reyes","arr_usd":575000,"adoption_pct":62.5,"health_score":66.0,"risk_band":"Watch","renewal_in_days":151,"expansion_arr_usd":0},
+{"account":"Gekko","tier":"Mid-Market","csm":"J. Reyes","arr_usd":115000,"adoption_pct":19.2,"health_score":45.0,"risk_band":"At Risk","renewal_in_days":41,"expansion_arr_usd":18000},
+{"account":"Prestige","tier":"SMB","csm":"A. Okafor","arr_usd":21000,"adoption_pct":59.2,"health_score":57.5,"risk_band":"Watch","renewal_in_days":260,"expansion_arr_usd":114000},
+{"account":"Oscorp","tier":"SMB","csm":"D. Haddad","arr_usd":13000,"adoption_pct":95.9,"health_score":74.6,"risk_band":"Watch","renewal_in_days":165,"expansion_arr_usd":90000},
+{"account":"Nakatomi","tier":"Mid-Market","csm":"D. Haddad","arr_usd":138000,"adoption_pct":87.3,"health_score":70.0,"risk_band":"Watch","renewal_in_days":316,"expansion_arr_usd":0},
+{"account":"Duff","tier":"SMB","csm":"M. Novak","arr_usd":13000,"adoption_pct":100,"health_score":84.2,"risk_band":"Healthy","renewal_in_days":272,"expansion_arr_usd":13000},
+{"account":"Bluth","tier":"Mid-Market","csm":"J. Reyes","arr_usd":131000,"adoption_pct":80.2,"health_score":71.0,"risk_band":"Watch","renewal_in_days":198,"expansion_arr_usd":28000},
+{"account":"Sterling Cooper","tier":"SMB","csm":"S. Bianchi","arr_usd":32000,"adoption_pct":100,"health_score":78.3,"risk_band":"Healthy","renewal_in_days":117,"expansion_arr_usd":0},
+{"account":"Dunder Mifflin","tier":"SMB","csm":"M. Novak","arr_usd":20000,"adoption_pct":83.3,"health_score":71.7,"risk_band":"Watch","renewal_in_days":104,"expansion_arr_usd":34000},
+{"account":"Wernham Hogg","tier":"Mid-Market","csm":"A. Okafor","arr_usd":128000,"adoption_pct":52.4,"health_score":43.6,"risk_band":"At Risk","renewal_in_days":123,"expansion_arr_usd":21000},
+{"account":"Cheddar","tier":"Mid-Market","csm":"M. Novak","arr_usd":123000,"adoption_pct":9.6,"health_score":37.1,"risk_band":"At Risk","renewal_in_days":12,"expansion_arr_usd":5000},
+{"account":"Paper St.","tier":"Mid-Market","csm":"J. Reyes","arr_usd":72000,"adoption_pct":62.1,"health_score":63.2,"risk_band":"Watch","renewal_in_days":196,"expansion_arr_usd":0},
+{"account":"Monsters Inc","tier":"Mid-Market","csm":"S. Bianchi","arr_usd":116000,"adoption_pct":54.1,"health_score":53.4,"risk_band":"At Risk","renewal_in_days":210,"expansion_arr_usd":43000},
+{"account":"Los Pollos","tier":"Mid-Market","csm":"J. Reyes","arr_usd":57000,"adoption_pct":21.3,"health_score":44.9,"risk_band":"At Risk","renewal_in_days":314,"expansion_arr_usd":0},
+{"account":"Bishop","tier":"SMB","csm":"S. Bianchi","arr_usd":18000,"adoption_pct":72.1,"health_score":60.5,"risk_band":"Watch","renewal_in_days":202,"expansion_arr_usd":82000},
+{"account":"Choam","tier":"Mid-Market","csm":"A. Okafor","arr_usd":48000,"adoption_pct":100,"health_score":76.9,"risk_band":"Healthy","renewal_in_days":255,"expansion_arr_usd":0},
+{"account":"Encom","tier":"Mid-Market","csm":"S. Bianchi","arr_usd":89000,"adoption_pct":97.5,"health_score":76.4,"risk_band":"Healthy","renewal_in_days":208,"expansion_arr_usd":33000},
+{"account":"Krusty Corp","tier":"Mid-Market","csm":"D. Haddad","arr_usd":61000,"adoption_pct":70.6,"health_score":62.7,"risk_band":"Watch","renewal_in_days":110,"expansion_arr_usd":0},
+{"account":"Planet Express","tier":"Enterprise","csm":"S. Bianchi","arr_usd":197000,"adoption_pct":56.1,"health_score":61.2,"risk_band":"Watch","renewal_in_days":202,"expansion_arr_usd":0},
+{"account":"Rich Industries","tier":"SMB","csm":"S. Bianchi","arr_usd":7000,"adoption_pct":91.3,"health_score":75.9,"risk_band":"Healthy","renewal_in_days":189,"expansion_arr_usd":39000},
+{"account":"Sirius Cyber","tier":"Enterprise","csm":"D. Haddad","arr_usd":343000,"adoption_pct":42.9,"health_score":54.5,"risk_band":"At Risk","renewal_in_days":55,"expansion_arr_usd":6000},
+{"account":"Allied","tier":"Mid-Market","csm":"M. Novak","arr_usd":40000,"adoption_pct":84.1,"health_score":69.5,"risk_band":"Watch","renewal_in_days":157,"expansion_arr_usd":22000},
+{"account":"Ollivander","tier":"SMB","csm":"J. Reyes","arr_usd":40000,"adoption_pct":100,"health_score":82.9,"risk_band":"Healthy","renewal_in_days":10,"expansion_arr_usd":0},
+{"account":"Zorg","tier":"SMB","csm":"J. Reyes","arr_usd":21000,"adoption_pct":91.0,"health_score":70.7,"risk_band":"Watch","renewal_in_days":178,"expansion_arr_usd":43000},
+{"account":"Spectre","tier":"SMB","csm":"M. Novak","arr_usd":7000,"adoption_pct":94.0,"health_score":70.4,"risk_band":"Watch","renewal_in_days":293,"expansion_arr_usd":40000},
+{"account":"Roxxon","tier":"SMB","csm":"S. Bianchi","arr_usd":13000,"adoption_pct":76.1,"health_score":71.9,"risk_band":"Watch","renewal_in_days":25,"expansion_arr_usd":52000},
+{"account":"Blue Sun","tier":"SMB","csm":"S. Bianchi","arr_usd":29000,"adoption_pct":40.8,"health_score":56.3,"risk_band":"Watch","renewal_in_days":128,"expansion_arr_usd":54000},
+{"account":"Genco","tier":"Mid-Market","csm":"M. Novak","arr_usd":105000,"adoption_pct":60.8,"health_score":58.8,"risk_band":"Watch","renewal_in_days":227,"expansion_arr_usd":47000},
+{"account":"Nakatomi Plaza","tier":"Enterprise","csm":"A. Okafor","arr_usd":555000,"adoption_pct":47.5,"health_score":57.5,"risk_band":"Watch","renewal_in_days":131,"expansion_arr_usd":0}
+];
+
+const dash=document.getElementById('dash');
+const fRisk=document.getElementById('f-risk');
+const fCsm=document.getElementById('f-csm');
+const fQ=document.getElementById('f-q');
+const countEl=document.getElementById('count');
+let sortKey='health_score', sortDir=1;
+
+const cols=[
+  {k:'account',label:'Account',n:false},
+  {k:'tier',label:'Tier',n:false},
+  {k:'csm',label:'CSM',n:false},
+  {k:'arr_usd',label:'ARR',n:true,fmt:v=>'$'+(Math.round(v/1000))+'K'},
+  {k:'adoption_pct',label:'Adopt%',n:true,bar:true},
+  {k:'health_score',label:'Health',n:true},
+  {k:'risk_band',label:'Risk',n:false,band:true},
+  {k:'renewal_in_days',label:'Renew (d)',n:true},
+  {k:'expansion_arr_usd',label:'Expand',n:true,fmt:v=>v>0?'$'+Math.round(v/1000)+'K':'—'},
+];
+
+function el(t,cls,txt){const e=document.createElement(t);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;}
+function note(msg){const n=el('div','note',msg);n.style.margin='var(--s4)';return n;}
+
+function render(){
+  const rb=fRisk.value, cs=fCsm.value, q=fQ.value.trim().toLowerCase();
+  let rows=DATA.filter(r=>
+    (!rb||r.risk_band===rb)&&(!cs||r.csm===cs)&&(!q||String(r.account).toLowerCase().includes(q))
+  );
+  const col=cols.find(c=>c.k===sortKey)||cols[5];
+  rows.sort((a,b)=>{
+    let av=a[sortKey], bv=b[sortKey];
+    if(col.n){av=Number(av);bv=Number(bv);return (av-bv)*sortDir;}
+    return String(av).localeCompare(String(bv))*sortDir;
+  });
+  countEl.textContent=rows.length+' / '+DATA.length+' accounts';
+  if(!rows.length){dash.replaceChildren(note('No accounts match these filters.'));return;}
+  const tbl=el('table','acc');
+  const thead=el('thead');const htr=el('tr');
+  cols.forEach(c=>{
+    const th=el('th',c.n?'n':null);th.scope='col';
+    const btn=el('button',null,c.label);
+    btn.type='button';
+    btn.style.cssText='font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer;text-align:inherit;letter-spacing:inherit;text-transform:inherit';
+    if(c.k===sortKey)btn.textContent=c.label+(sortDir===1?' ▲':' ▼');
+    btn.setAttribute('aria-label','Sort by '+c.label);
+    btn.addEventListener('click',()=>{
+      if(sortKey===c.k)sortDir=-sortDir; else {sortKey=c.k;sortDir=c.n?1:1;}
+      render();
+    });
+    th.appendChild(btn);htr.appendChild(th);
+  });
+  thead.appendChild(htr);tbl.appendChild(thead);
+  const tb=el('tbody');
+  rows.forEach(r=>{
+    const tr=el('tr');
+    cols.forEach(c=>{
+      const td=el('td',c.n?'n':null);
+      let v=r[c.k];
+      if(c.band){const s=el('span','band '+String(v).replace(/\s/g,''),v);td.appendChild(s);}
+      else if(c.bar){
+        const pct=Math.max(0,Math.min(100,Number(v)));
+        const bar=el('span','hbar');bar.style.width=(pct*0.55)+'px';
+        td.appendChild(bar);td.appendChild(document.createTextNode(' '+pct));
+      }
+      else td.textContent=c.fmt?c.fmt(Number(v)):v;
+      tr.appendChild(td);
+    });
+    tb.appendChild(tr);
+  });
+  tbl.appendChild(tb);
+  dash.replaceChildren(tbl);
+}
+[...new Set(DATA.map(r=>r.csm))].sort().forEach(c=>{const o=el('option',null,c);fCsm.appendChild(o);});
+[fRisk,fCsm,fQ].forEach(e=>e.addEventListener('input',render));
+render();
+</script>
+</body>
+</html>
